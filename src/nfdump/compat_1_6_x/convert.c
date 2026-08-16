@@ -474,7 +474,7 @@ void ConvertBlockType2(dataBlock_t *v2DataBlock, dataBlock_t *v3DataBlock) {
                 v3DataBlock->size += v2record_ptr->size;
             } break;
             default: {
-                printf("Convert v2 block: Unknown record type %i skipped\n", v2record_ptr->type);
+                fprintf(stderr, "Convert v2 block: Unknown record type %i skipped\n", v2record_ptr->type);
             }
         }
 

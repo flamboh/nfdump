@@ -126,7 +126,7 @@ static int AddOldNbarRecord(arrayRecordHeader_t *nbarRecord) {
                 InsertNbarAppInfo(NbarAppInfo, nbarData);
             } break;
             default:
-                printf("Unknown nbar element id: %u\n", elementHeader->type);
+                fprintf(stderr, "Unknown nbar element id: %u\n", elementHeader->type);
         }
     }
 

@@ -36,7 +36,7 @@
 
 #include "nfdump.h"
 
-typedef enum { MODE_NULL = 0, MODE_RAW, MODE_FMT, MODE_CSV, MODE_CSV_FAST, MODE_JSON, MODE_NDJSON } outputMode_t;
+typedef enum { MODE_NULL = 0, MODE_RAW, MODE_FMT, MODE_CSV, MODE_CSV_FAST, MODE_JSON, MODE_NDJSON, MODE_ATLANTIS } outputMode_t;
 
 typedef struct outputParams_s {
     bool printPlain;

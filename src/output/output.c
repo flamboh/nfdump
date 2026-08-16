@@ -40,6 +40,7 @@
 
 #include "conf/nfconf.h"
 #include "nfdump.h"
+#include "output_atlantis.h"
 #include "output_csv.h"
 #include "output_fmt.h"
 #include "output_json.h"
@@ -107,6 +108,7 @@ static struct printmap_s {
                           {"ndjson", MODE_NDJSON, NULL, "ndjson output formart"},
                           {"csv", MODE_CSV, FORMAT_CSV, "csv predefined"},
                           {"csv-fast", MODE_CSV_FAST, NULL, "csv fast predefined"},
+                          {"atlantis", MODE_ATLANTIS, NULL, "Atlantis Flow Stream v1"},
                           {"null", MODE_NULL, NULL, "do not print any output"},
 
                           // This is always the last line
@@ -123,7 +125,8 @@ static struct printerFunc_s {
                     [MODE_CSV] = {csv_record, csv_prolog, csv_epilog},
                     [MODE_CSV_FAST] = {csv_record_fast, csv_prolog_fast, csv_epilog_fast},
                     [MODE_JSON] = {flow_record_to_json, json_prolog, json_epilog},
-                    [MODE_NDJSON] = {flow_record_to_ndjson, ndjson_prolog, ndjson_epilog}};
+                    [MODE_NDJSON] = {flow_record_to_ndjson, ndjson_prolog, ndjson_epilog},
+                    [MODE_ATLANTIS] = {atlantis_record, atlantis_prolog, atlantis_epilog}};
 
 static PrologPrinter_t print_prolog;  // prints the output prolog
 static PrologPrinter_t print_epilog;  // prints the output epilog

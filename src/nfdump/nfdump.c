@@ -96,6 +96,7 @@ typedef struct filterArgs_s {
     _Atomic int self;
     _Atomic uint64_t processedRecords;
     _Atomic uint64_t passedRecords;
+    outputMode_t outputMode;
     int hasGeoDB;
     int numWorkers;
     void *engine;
@@ -439,7 +440,10 @@ __attribute__((noreturn)) static void *filterThread(void *arg) {
             // work on our record
             switch (record_ptr->type) {
                 case CommonRecordType:
-                    printf("Need to convert record type: %u\n", CommonRecordType);
+                    if (filterArgs->outputMode == MODE_ATLANTIS)
+                        LogError("Need to convert record type: %u", CommonRecordType);
+                    else
+                        printf("Need to convert record type: %u\n", CommonRecordType);
                     sumSize = 0;
                     break;
                 case V3Record: {
@@ -527,6 +531,7 @@ static stat_record_t process_data(void *engine, int processMode, char *wfile, Re
         .processQueue = queue_init(8),
         .timeWindow = timeWindow,
         .hasGeoDB = outputParams->hasGeoDB,
+        .outputMode = outputParams->mode,
     };
     queue_producers(filterArgs.processQueue, numWorkers);
 
@@ -617,7 +622,10 @@ static stat_record_t process_data(void *engine, int processMode, char *wfile, Re
 
                 } break;
                 case ExtensionMapType:
-                    printf("ExtensionMap no longer handled here!\n");
+                    if (outputParams->mode == MODE_ATLANTIS)
+                        LogError("ExtensionMap no longer handled here!");
+                    else
+                        printf("ExtensionMap no longer handled here!\n");
                     break;
                 case ExporterInfoRecordType: {
                     int ret = AddExporterInfo((exporter_info_record_t *)record_ptr);
@@ -1241,12 +1249,8 @@ int main(int argc, char **argv) {
     }
 
     if (print_order && flow_stat) {
-        printf("-s record and -O (-m) are mutually exclusive options\n");
+        LogError("-s record and -O (-m) are mutually exclusive options");
         exit(EXIT_FAILURE);
-    }
-
-    if (!(flow_stat || element_stat)) {
-        PrintProlog(outputParams);
     }
 
     int processMode = PRINTRECORD;
@@ -1261,11 +1265,20 @@ int main(int argc, char **argv) {
         processMode = WRITEFILE;
     }
 
+    if (outputParams->mode == MODE_ATLANTIS && processMode != PRINTRECORD) {
+        LogError("Atlantis output requires record mode; aggregation, statistics, sorting, and file output are not supported");
+        exit(EXIT_FAILURE);
+    }
+
+    if (!(flow_stat || element_stat)) {
+        PrintProlog(outputParams);
+    }
+
     nfprof_start(&profile_data);
     sum_stat = process_data(engine, processMode, wfile, print_record, flist.timeWindow, limitRecords, outputParams, compress);
     nfprof_end(&profile_data, totalRecords);
 
-    if (totalPassed == 0) {
+    if (totalPassed == 0 && outputParams->mode != MODE_ATLANTIS) {
         printf("No matching flows\n");
     }
 
@@ -1324,6 +1337,8 @@ int main(int argc, char **argv) {
                 break;
             case MODE_JSON:
             case MODE_NDJSON:
+                break;
+            case MODE_ATLANTIS:
                 break;
         }
 

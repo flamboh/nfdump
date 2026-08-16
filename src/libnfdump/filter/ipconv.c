@@ -105,7 +105,7 @@ static int lookup_host(const char *hostname, ipStack_t *ipStack) {
     char addrstr[128];
     char reverse[256];
 
-    printf("Resolving %s ...\n", hostname);
+    fprintf(stderr, "Resolving %s ...\n", hostname);
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = PF_UNSPEC;
@@ -158,7 +158,7 @@ static int lookup_host(const char *hostname, ipStack_t *ipStack) {
             // fprintf(stderr, "Failed to reverse lookup %s: %s\n", addrstr, gai_strerror(errcode));
         }
 
-        printf("IPv%d address: %s (%s)\n", res->ai_family == PF_INET6 ? 6 : 4, addrstr, reverse);
+        fprintf(stderr, "IPv%d address: %s (%s)\n", res->ai_family == PF_INET6 ? 6 : 4, addrstr, reverse);
         res = res->ai_next;
         numIP++;
     }

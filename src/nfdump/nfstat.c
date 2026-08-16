@@ -1456,6 +1456,8 @@ void PrintElementStat(stat_record_t *sum_stat, outputParams_t *outputParams, Rec
                             PrintJsonStatLine(StatParameters[stat].statname, sum_stat, outputParams, &topN_element_list[index], type,
                                               StatRequest[hash_num].order_proto, orderByTable[order_index].inout);
                             break;
+                        case MODE_ATLANTIS:
+                            break;
                     }
                     index += increment;
                 }

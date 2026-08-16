@@ -1,6 +1,6 @@
 
 check_PROGRAMS = nftest nfgen
-TESTS = nftest runprepare.sh runlzo.sh runlz4.sh
+TESTS = nftest runprepare.sh runlzo.sh runlz4.sh runatlantis.sh
 
 if HAVE_BZIP2
 TEST_BZIP2=yes
@@ -35,5 +35,5 @@ nftest_LDADD = -lnfdump -lnffile
 nftest_LDFLAGS = -L../libnfdump -L../libnffile
 nftest_DEPENDENCIES = nfgen
 
-EXTRA_DIST = runtest.sh nftest.1.out nftest.2.out 
-CLEANFILES = $(check_PROGRAMS) test.flows.nf *.gch 
+EXTRA_DIST = runtest.sh runatlantis.sh nftest.1.out nftest.2.out
+CLEANFILES = $(check_PROGRAMS) test.flows.nf *.gch

@@ -1,4 +1,5 @@
 directory = $(top_srcdir)/doc
+EXTRA_DIST = atlantis-flow-stream.md
 
 if HAVE_DOXYGEN
 
@@ -21,4 +22,3 @@ clean-local:
 	rm -rf html
 	rm -rf man
 	rm -rf xml
-

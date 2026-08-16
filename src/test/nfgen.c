@@ -598,6 +598,19 @@ int main(int argc, char **argv) {
     UpdateRecord(recordHandle);
     dataBlock = StoreRecord(recordHandle, nffile, dataBlock);
 
+    // Optional Atlantis fixture: the output mode must emit the synthetic
+    // tunnel record before this outer flow without copying its count or TTL.
+    if (argc > 1 && strcmp(argv[1], "--atlantis-tunnel") == 0) {
+        PushExtension(v3Record, EXtunIPv4, tunIPv4);
+        AssertMapRecordHandle(recordHandle, v3Record, 0);
+        inet_pton(PF_INET, "10.0.0.1", &tunIPv4->tunSrcAddr);
+        inet_pton(PF_INET, "10.0.0.2", &tunIPv4->tunDstAddr);
+        tunIPv4->tunSrcAddr = ntohl(tunIPv4->tunSrcAddr);
+        tunIPv4->tunDstAddr = ntohl(tunIPv4->tunDstAddr);
+        tunIPv4->tunProto = IPPROTO_IPIP;
+        dataBlock = StoreRecord(recordHandle, nffile, dataBlock);
+    }
+
     FlushBlock(nffile, dataBlock);
     CloseUpdateFile(nffile);
     return 0;
