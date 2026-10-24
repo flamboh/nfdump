@@ -175,44 +175,51 @@ uint32_t anonymize(const uint32_t orig_addr) {
     return result ^ orig_addr;
 }
 
-/* little endian CPU's are boring! - but give it a try
- * orig_addr is a ptr to memory, return by inet_pton for IPv6
- * anon_addr return the result in the same order
+/* orig_addr is the IPv6 address as two 64 bit words in host byte order,
+ * orig_addr[0] holding the most significant bits.
+ * anon_addr returns the result in the same order
  */
 void anonymize_v6(const uint64_t orig_addr[2], uint64_t *anon_addr) {
-    uint8_t rin_output[16], *orig_bytes, *result;
+    uint8_t rin_output[16];
     uint8_t rin_input[16];
+    uint64_t pad[2] = {0, 0};
+    uint64_t result[2] = {0, 0};
 
-    int pos, i, bit_num, left_byte;
-
-    anon_addr[0] = anon_addr[1] = 0;
-    result = (uint8_t *)anon_addr;
-    orig_bytes = (uint8_t *)orig_addr;
+    for (int i = 0; i < 8; i++) {
+        pad[0] = (pad[0] << 8) | m_pad[i];
+        pad[1] = (pad[1] << 8) | m_pad[i + 8];
+    }
 
     // For each prefixes with length from 0 to 127, generate a bit using the Rijndael cipher,
     // which is used as a pseudorandom function here. The bits generated in every rounds
     // are combineed into a pseudorandom one-time-pad.
-    for (pos = 0; pos <= 127; pos++) {
-        bit_num = pos & 0x7;
-        left_byte = (pos >> 3);
-
-        for (i = 0; i < left_byte; i++) {
-            rin_input[i] = orig_bytes[i];
+    for (int pos = 0; pos <= 127; pos++) {
+        // Padding: The most significant pos bits are taken from orig_addr. The other 128-pos
+        // bits are taken from m_pad. Work on 64 bit words, so the bit order does not depend
+        // on the byte order of the host.
+        uint64_t input[2];
+        if (pos < 64) {
+            uint64_t mask = pos ? ~0ULL << (64 - pos) : 0;
+            input[0] = (orig_addr[0] & mask) | (pad[0] & ~mask);
+            input[1] = pad[1];
+        } else {
+            uint64_t mask = pos > 64 ? ~0ULL << (128 - pos) : 0;
+            input[0] = orig_addr[0];
+            input[1] = (orig_addr[1] & mask) | (pad[1] & ~mask);
         }
-        rin_input[left_byte] = orig_bytes[left_byte] >> (7 - bit_num) << (7 - bit_num) | (m_pad[left_byte] << bit_num) >> bit_num;
-        for (i = left_byte + 1; i < 16; i++) {
-            rin_input[i] = m_pad[i];
+        for (int i = 0; i < 8; i++) {
+            rin_input[i] = (uint8_t)(input[0] >> (56 - 8 * i));
+            rin_input[i + 8] = (uint8_t)(input[1] >> (56 - 8 * i));
         }
 
         // Encryption: The Rijndael cipher is used as pseudorandom function. During each
         // round, only the first bit of rin_output is used.
         Rijndael_blockEncrypt(rin_input, 128, rin_output);
 
-        // Combination: pos counts from the most-significant bit of each byte.
-        // Store the generated bit at the same position
-        result[left_byte] |= (rin_output[0] >> 7) << (7 - bit_num);
+        // Combination: the bits are combined into a pseudorandom one-time-pad
+        result[pos >> 6] |= (uint64_t)(rin_output[0] >> 7) << (63 - (pos & 0x3F));
     }
     // XOR the original address with the pseudorandom one-time-pad
-    anon_addr[0] ^= orig_addr[0];
-    anon_addr[1] ^= orig_addr[1];
+    anon_addr[0] = result[0] ^ orig_addr[0];
+    anon_addr[1] = result[1] ^ orig_addr[1];
 }
