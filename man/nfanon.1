@@ -39,6 +39,7 @@
 .Op Fl C Ar config
 .Op Fl s
 .Op Fl d
+.Op Fl N Ar file
 .Op Fl q
 .Op Fl t Ar num
 .Op Fl v Ar level
@@ -105,6 +106,32 @@ to suppress configuration-file loading.
 Preserve source addresses rather than anonymising them.
 .It Fl d
 Preserve destination addresses rather than anonymising them.
+.It Fl N Ar file
+Anonymize only addresses in the networks listed in
+.Ar file .
+The file contains one IPv4 or IPv6 network in CIDR notation per line. A bare
+address is a single host. A line starting with
+.Sy !
+lists a network to preserve. Blank lines and text after
+.Sy #
+are ignored. Each address is checked against the most specific matching
+network: it is anonymized only if that network is not a preserve network.
+Addresses that match no network are left unchanged.
+This applies to all addresses, including next hop, BGP next hop, router IP,
+NAT, tunnel and exporter addresses.
+.Fl s
+and
+.Fl d
+still apply to the source and destination side. The source AS and previous
+adjacent AS are set to 0 only if the source address was anonymized, the
+destination AS and next adjacent AS only if the destination address was.
+.Pp
+IPv4-mapped IPv6 addresses (::ffff:0:0/96) are checked against the IPv4
+networks. A mapped network ::ffff:a.b.c.d/n with n >= 96 in
+.Ar file
+is the IPv4 network a.b.c.d/n-96. An IPv6 network, which covers the mapped
+range without being part of it, such as ::/0, applies to the other IPv6
+addresses only.
 .It Fl q
 Deprecated compatibility option; it is rejected. Use
 .Fl v 0

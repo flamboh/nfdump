@@ -61,6 +61,7 @@
 #include "nfdump.h"
 #include "nfdump_1_6_x.h"
 #include "nffile.h"
+#include "netlist.h"
 #include "nfxV3.h"
 #include "panonymizer.h"
 #include "util.h"
@@ -77,6 +78,9 @@ typedef struct worker_param_s {
     // sync barrier
     pthread_control_barrier_t *barrier;
 } worker_param_t;
+
+// optional list of networks to anonymize
+static netList_t *netList = NULL;
 
 // set by the workers, if a record can not be anonymized
 static atomic_int anonError = 0;
@@ -137,6 +141,7 @@ static void usage(char *name) {
         "-K <key>\tAnonymize IP addresses using CryptoPAn with key <key>.\n"
         "-s\t\tPreserve source address.\n"
         "-d\t\tPreserve destination address.\n"
+        "-N <file>\tAnonymize only addresses in the networks listed in <file>.\n"
         "-q\t\tDeprecated and rejected; use -v 0 to suppress progress output.\n"
         "-r <path>\tread input from single file or all files in directory.\n"
         "-v level\tSet verbose level.\n"
@@ -171,6 +176,21 @@ static void BlockSignals(int block) {
     pthread_sigmask(block ? SIG_BLOCK : SIG_UNBLOCK, &termSignals, NULL);
 }  // End of BlockSignals
 
+static inline int AnonIPv4(uint32_t *ip) {
+    if (netList && !NetListMatchV4(netList, *ip)) return 0;
+    *ip = anonymize(*ip);
+    return 1;
+}  // End of AnonIPv4
+
+static inline int AnonIPv6(uint64_t ip[2]) {
+    if (netList && !NetListMatchV6(netList, ip)) return 0;
+    uint64_t anon_ip[2];
+    anonymize_v6(ip, anon_ip);
+    ip[0] = anon_ip[0];
+    ip[1] = anon_ip[1];
+    return 1;
+}  // End of AnonIPv6
+
 static inline int AnonExporterInfo(exporter_info_record_t *exporter_record) {
     const uint8_t prefix[12] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff};
 
@@ -178,8 +198,6 @@ static inline int AnonExporterInfo(exporter_info_record_t *exporter_record) {
         LogError("Corrupt exporter record in %s line %d", __FILE__, __LINE__);
         return 0;
     }
-
-    uint64_t anon_ip[2];
 
     ip128_t ipAddr;
     uint64_t *u = (uint64_t *)ipAddr.bytes;
@@ -193,7 +211,8 @@ static inline int AnonExporterInfo(exporter_info_record_t *exporter_record) {
                 // anonymise IPv4
                 uint32_t ipv4;
                 memcpy(&ipv4, ipAddr.bytes + 12, sizeof(uint32_t));
-                ipv4 = anonymize(ntohl(ipv4));
+                ipv4 = ntohl(ipv4);
+                AnonIPv4(&ipv4);
                 ipv4 = htonl(ipv4);
                 memcpy(ipAddr.bytes + 12, &ipv4, sizeof(uint32_t));
 
@@ -201,13 +220,14 @@ static inline int AnonExporterInfo(exporter_info_record_t *exporter_record) {
                 // anonymise IPv6
                 u[0] = ntohll(u[0]);
                 u[1] = ntohll(u[1]);
-                anonymize_v6(u, anon_ip);
-                u[0] = htonll(anon_ip[0]);
-                u[1] = htonll(anon_ip[1]);
+                AnonIPv6(u);
+                u[0] = htonll(u[0]);
+                u[1] = htonll(u[1]);
             }
         } break;
         case AF_INET: {  // old IPV4 record
-            uint32_t ipv4 = anonymize(u[1]);
+            uint32_t ipv4 = u[1];
+            AnonIPv4(&ipv4);
 
             // convert to new representation
             ipv4 = htonl(ipv4);
@@ -221,9 +241,9 @@ static inline int AnonExporterInfo(exporter_info_record_t *exporter_record) {
             // copy back to exporter ip
         } break;
         default: {  // old IPv6 record - like nfdump, take any other address family as IPv6
-            anonymize_v6(u, anon_ip);
-            u[0] = htonll(anon_ip[0]);
-            u[1] = htonll(anon_ip[1]);
+            AnonIPv6(u);
+            u[0] = htonll(u[0]);
+            u[1] = htonll(u[1]);
 
             // convert to new representation
             exporter_record->fill = 0;
@@ -270,13 +290,19 @@ static inline int AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon_
         return 0;
     }
 
+    // extensions are stored in any order. Remember the AS extensions and
+    // update them, after all addresses are processed
+    EXasRouting_t *asRouting = NULL;
+    EXasAdjacent_t *asAdjacent = NULL;
+    int srcAnon = 0;
+    int dstAnon = 0;
+
     SetFlag(v3Record->flags, V3_FLAG_ANON);
     dbg_printf("Record announces %u extensions with total size %u\n", v3Record->numElements, v3Record->size);
     // first record header
     elementHeader = (elementHeader_t *)(p + sizeof(recordHeaderV3_t));
     int i;
     for (i = 0; i < v3Record->numElements; i++) {
-        uint64_t anon_ip[2];
         // the extension must lie within the record and have the size of its type.
         // An unknown extension may hold addresses
         if ((void *)elementHeader + sizeof(elementHeader_t) > eor || elementHeader->type >= MAXEXTENSIONS ||
@@ -294,22 +320,13 @@ static inline int AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon_
                 break;
             case EXipv4FlowID: {
                 EXipv4Flow_t *ipv4Flow = (EXipv4Flow_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                if (anon_src) ipv4Flow->srcAddr = anonymize(ipv4Flow->srcAddr);
-                if (anon_dst) ipv4Flow->dstAddr = anonymize(ipv4Flow->dstAddr);
+                if (anon_src) srcAnon |= AnonIPv4(&ipv4Flow->srcAddr);
+                if (anon_dst) dstAnon |= AnonIPv4(&ipv4Flow->dstAddr);
             } break;
             case EXipv6FlowID: {
                 EXipv6Flow_t *ipv6Flow = (EXipv6Flow_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                if (anon_src) {
-                    anonymize_v6(ipv6Flow->srcAddr, anon_ip);
-                    ipv6Flow->srcAddr[0] = anon_ip[0];
-                    ipv6Flow->srcAddr[1] = anon_ip[1];
-                }
-
-                if (anon_dst) {
-                    anonymize_v6(ipv6Flow->dstAddr, anon_ip);
-                    ipv6Flow->dstAddr[0] = anon_ip[0];
-                    ipv6Flow->dstAddr[1] = anon_ip[1];
-                }
+                if (anon_src) srcAnon |= AnonIPv6(ipv6Flow->srcAddr);
+                if (anon_dst) dstAnon |= AnonIPv6(ipv6Flow->dstAddr);
             } break;
             case EXflowMiscID:
                 break;
@@ -318,48 +335,38 @@ static inline int AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon_
             case EXvLanID:
                 break;
             case EXasRoutingID: {
-                EXasRouting_t *asRouting = (EXasRouting_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                if (anon_src) asRouting->srcAS = 0;
-                if (anon_dst) asRouting->dstAS = 0;
+                asRouting = (EXasRouting_t *)((void *)elementHeader + sizeof(elementHeader_t));
             } break;
             case EXbgpNextHopV4ID: {
                 EXbgpNextHopV4_t *bgpNextHopV4 = (EXbgpNextHopV4_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                bgpNextHopV4->ip = anonymize(bgpNextHopV4->ip);
+                AnonIPv4(&bgpNextHopV4->ip);
             } break;
             case EXbgpNextHopV6ID: {
                 EXbgpNextHopV6_t *bgpNextHopV6 = (EXbgpNextHopV6_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                anonymize_v6(bgpNextHopV6->ip, anon_ip);
-                bgpNextHopV6->ip[0] = anon_ip[0];
-                bgpNextHopV6->ip[1] = anon_ip[1];
+                AnonIPv6(bgpNextHopV6->ip);
             } break;
             case EXipNextHopV4ID: {
                 EXipNextHopV4_t *ipNextHopV4 = (EXipNextHopV4_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                ipNextHopV4->ip = anonymize(ipNextHopV4->ip);
+                AnonIPv4(&ipNextHopV4->ip);
             } break;
             case EXipNextHopV6ID: {
                 EXipNextHopV6_t *ipNextHopV6 = (EXipNextHopV6_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                anonymize_v6(ipNextHopV6->ip, anon_ip);
-                ipNextHopV6->ip[0] = anon_ip[0];
-                ipNextHopV6->ip[1] = anon_ip[1];
+                AnonIPv6(ipNextHopV6->ip);
             } break;
             case EXipReceivedV4ID: {
                 EXipReceivedV4_t *ipReceived = (EXipReceivedV4_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                ipReceived->ip = anonymize(ipReceived->ip);
+                AnonIPv4(&ipReceived->ip);
             } break;
             case EXipReceivedV6ID: {
                 EXipReceivedV6_t *ipReceived = (EXipReceivedV6_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                anonymize_v6(ipReceived->ip, anon_ip);
-                ipReceived->ip[0] = anon_ip[0];
-                ipReceived->ip[1] = anon_ip[1];
+                AnonIPv6(ipReceived->ip);
             } break;
             case EXmplsLabelID:
                 break;
             case EXmacAddrID:
                 break;
             case EXasAdjacentID: {
-                EXasAdjacent_t *asAdjacent = (EXasAdjacent_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                asAdjacent->nextAdjacentAS = 0;
-                asAdjacent->prevAdjacentAS = 0;
+                asAdjacent = (EXasAdjacent_t *)((void *)elementHeader + sizeof(elementHeader_t));
             } break;
             case EXlatencyID:
                 break;
@@ -367,39 +374,23 @@ static inline int AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon_
                 break;
             case EXnatXlateIPv4ID: {
                 EXnatXlateIPv4_t *natXlateIPv4 = (EXnatXlateIPv4_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                if (anon_src) natXlateIPv4->xlateSrcAddr = anonymize(natXlateIPv4->xlateSrcAddr);
-                if (anon_dst) natXlateIPv4->xlateDstAddr = anonymize(natXlateIPv4->xlateDstAddr);
+                if (anon_src) AnonIPv4(&natXlateIPv4->xlateSrcAddr);
+                if (anon_dst) AnonIPv4(&natXlateIPv4->xlateDstAddr);
             } break;
             case EXnatXlateIPv6ID: {
                 EXnatXlateIPv6_t *natXlateIPv6 = (EXnatXlateIPv6_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                if (anon_src) {
-                    anonymize_v6(natXlateIPv6->xlateSrcAddr, anon_ip);
-                    natXlateIPv6->xlateSrcAddr[0] = anon_ip[0];
-                    natXlateIPv6->xlateSrcAddr[1] = anon_ip[1];
-                }
-                if (anon_dst) {
-                    anonymize_v6(natXlateIPv6->xlateDstAddr, anon_ip);
-                    natXlateIPv6->xlateDstAddr[0] = anon_ip[0];
-                    natXlateIPv6->xlateDstAddr[1] = anon_ip[1];
-                }
+                if (anon_src) AnonIPv6(natXlateIPv6->xlateSrcAddr);
+                if (anon_dst) AnonIPv6(natXlateIPv6->xlateDstAddr);
             } break;
             case EXtunIPv4ID: {
                 EXtunIPv4_t *tunIPv4 = (EXtunIPv4_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                if (anon_src) tunIPv4->tunSrcAddr = anonymize(tunIPv4->tunSrcAddr);
-                if (anon_dst) tunIPv4->tunDstAddr = anonymize(tunIPv4->tunDstAddr);
+                if (anon_src) AnonIPv4(&tunIPv4->tunSrcAddr);
+                if (anon_dst) AnonIPv4(&tunIPv4->tunDstAddr);
             } break;
             case EXtunIPv6ID: {
                 EXtunIPv6_t *tunIPv6 = (EXtunIPv6_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                if (anon_src) {
-                    anonymize_v6(tunIPv6->tunSrcAddr, anon_ip);
-                    tunIPv6->tunSrcAddr[0] = anon_ip[0];
-                    tunIPv6->tunSrcAddr[1] = anon_ip[1];
-                }
-                if (anon_dst) {
-                    anonymize_v6(tunIPv6->tunDstAddr, anon_ip);
-                    tunIPv6->tunDstAddr[0] = anon_ip[0];
-                    tunIPv6->tunDstAddr[1] = anon_ip[1];
-                }
+                if (anon_src) AnonIPv6(tunIPv6->tunSrcAddr);
+                if (anon_dst) AnonIPv6(tunIPv6->tunDstAddr);
             } break;
             case EXinPayloadID:
             case EXoutPayloadID:
@@ -419,6 +410,27 @@ static inline int AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon_
     if ((void *)elementHeader != eor) {
         LogError("Corrupt record: %u bytes after %u extensions", (unsigned)(eor - (void *)elementHeader), v3Record->numElements);
         return 0;
+    }
+
+    if (netList) {
+        // zero the AS numbers of the anonymized sides only
+        if (asRouting) {
+            if (srcAnon) asRouting->srcAS = 0;
+            if (dstAnon) asRouting->dstAS = 0;
+        }
+        if (asAdjacent) {
+            if (srcAnon) asAdjacent->prevAdjacentAS = 0;
+            if (dstAnon) asAdjacent->nextAdjacentAS = 0;
+        }
+    } else {
+        if (asRouting) {
+            if (anon_src) asRouting->srcAS = 0;
+            if (anon_dst) asRouting->dstAS = 0;
+        }
+        if (asAdjacent) {
+            asAdjacent->nextAdjacentAS = 0;
+            asAdjacent->prevAdjacentAS = 0;
+        }
     }
 
     return 1;
@@ -903,12 +915,13 @@ int main(int argc, char **argv) {
     flist_t flist = {0};
 
     char *configFile = NULL;
+    char *netListFile = NULL;
     int numWorkers = 0;
     int verbose = -1;
     int anon_src = 1;
     int anon_dst = 1;
     int c;
-    while ((c = getopt(argc, argv, "C:hsdK:qr:t:v:w:W:")) != EOF) {
+    while ((c = getopt(argc, argv, "C:hsdK:N:qr:t:v:w:W:")) != EOF) {
         switch (c) {
             case 'h':
                 usage(argv[0]);
@@ -936,6 +949,10 @@ int main(int argc, char **argv) {
                 break;
             case 'd':
                 anon_dst = 0;
+                break;
+            case 'N':
+                CheckArgLen(optarg, MAXPATHLEN);
+                netListFile = optarg;
                 break;
             case 'q':
                 LogError("Option -q deprecated. Use -v 0");
@@ -995,6 +1012,11 @@ int main(int argc, char **argv) {
         exit(255);
     }
 
+    if (netListFile) {
+        netList = NetListLoad(netListFile);
+        if (!netList) exit(255);
+    }
+
     if (ConfOpen(configFile, "nfanon") < 0) exit(EXIT_FAILURE);
 
     // check numWorkers depending on cores online
@@ -1049,6 +1071,7 @@ int main(int argc, char **argv) {
 
     free(tid);
     free(workerList);
+    NetListFree(netList);
 
     return 0;
 }
