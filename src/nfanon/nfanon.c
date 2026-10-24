@@ -57,7 +57,9 @@
 #include "ip128.h"
 #include "nbar.h"
 #include "nfconf.h"
+#include "nfx.h"
 #include "nfdump.h"
+#include "nfdump_1_6_x.h"
 #include "nffile.h"
 #include "nfxV3.h"
 #include "panonymizer.h"
@@ -84,6 +86,24 @@ static char pendingFile[MAXPATHLEN] = {0};
 
 // signals, which remove the pending file. Only the main thread handles them
 static sigset_t termSignals;
+
+// nfdump 1.6 records grow, when converted to V3 records. Every 1.6 extension of at least
+// 4 bytes converts to at most 72 bytes, and the fixed part to at most 148 bytes.
+// Convert a type 2 block in parts, which surely fit into one V3 block
+#define LEGACY_V3SIZE(extensionSize) (148 + 18 * (extensionSize))
+#define LEGACY_PARTSIZE (WRITE_BUFFSIZE - 65536)
+
+// type 2 block, which is converted in parts
+typedef struct legacyBlock_s {
+    dataBlock_t *dataBlock;
+    uint32_t offset;      // offset of the next record
+    uint32_t nextRecord;  // index of the next record
+} legacyBlock_t;
+
+static legacyBlock_t legacyBlock = {0};
+
+// extension size of the nfdump 1.6 extension maps seen so far in the current file, -1 if unknown
+static int32_t legacyMapSize[MAX_EXTENSION_MAPS];
 
 /* Function Prototypes */
 static void usage(char *name);
@@ -458,16 +478,131 @@ static nffile_t *OpenNextFile(queue_t *fileList) {
     return nffile;
 }  // End of OpenNextFile
 
-// read the next data block. Fail on a truncated or corrupt input file
-static dataBlock_t *NextBlock(nffile_t *nffile, uint32_t *blockCount) {
-    dataBlock_t *dataBlock = ReadBlock(nffile, NULL);
-    if (dataBlock) {
-        (*blockCount)++;
-    } else if (*blockCount != nffile->file_header->NumBlocks) {
-        LogError("Failed to read input file '%s': %u of %u blocks read", nffile->fileName, *blockCount, nffile->file_header->NumBlocks);
-        exit(255);
+// size of a nfdump 1.6 record converted to V3. Fails on corrupt records
+static uint32_t LegacyRecordSize(record_header_t *record, const char *fileName) {
+    switch (record->type) {
+        case ExtensionMapType: {
+            extension_map_t *map = (extension_map_t *)record;
+            if (record->size < sizeof(extension_map_t)) break;
+            legacyMapSize[map->map_id] = map->extension_size;
+            return 0;
+        }
+        case CommonRecordType: {
+            common_record_t *commonRecord = (common_record_t *)record;
+            if (record->size < sizeof(common_record_t) || legacyMapSize[commonRecord->ext_map] < 0) break;
+            uint32_t size = offsetof(common_record_t, data);
+            size += TestFlag(commonRecord->flags, FLAG_IPV6_ADDR) ? 4 * sizeof(uint64_t) : 2 * sizeof(uint32_t);
+            size += TestFlag(commonRecord->flags, FLAG_PKG_64) ? sizeof(uint64_t) : sizeof(uint32_t);
+            size += TestFlag(commonRecord->flags, FLAG_BYTES_64) ? sizeof(uint64_t) : sizeof(uint32_t);
+            size += legacyMapSize[commonRecord->ext_map];
+            // the record must hold exactly the extensions of its map
+            if (record->size != size || record->size > 2048) break;
+            return LEGACY_V3SIZE(legacyMapSize[commonRecord->ext_map]);
+        }
+        case ExporterInfoRecordType:
+        case ExporterStatRecordType:
+        case SamplerLegacyRecordType:
+            // copied unmodified
+            return record->size;
     }
-    return dataBlock;
+    LogError("Can not convert nfdump 1.6 record type %u with size %u in '%s'", record->type, record->size, fileName);
+    exit(255);
+}  // End of LegacyRecordSize
+
+// each file defines its own extension maps
+static void ResetLegacyMaps(void) {
+    for (int i = 0; i < MAX_EXTENSION_MAPS; i++) legacyMapSize[i] = -1;
+    ResetCompat16();
+}  // End of ResetLegacyMaps
+
+// convert the next records of a type 2 block into a V3 block. Returns NULL at the end of the block
+static dataBlock_t *ConvertLegacyBlock(legacyBlock_t *legacy, const char *fileName) {
+    dataBlock_t *dataBlock = legacy->dataBlock;
+    if (legacy->nextRecord == dataBlock->NumRecords) {
+        if (legacy->offset != dataBlock->size) {
+            LogError("Corrupt data file. %u bytes after the last record in '%s'", dataBlock->size - legacy->offset, fileName);
+            exit(255);
+        }
+        return NULL;
+    }
+
+    dataBlock_t *v3Block = NewDataBlock();
+    dataBlock_t *partBlock = NewDataBlock();
+    if (!v3Block || !partBlock) exit(255);
+
+    // convert parts of records, which surely fit into the space left in the V3 block
+    while (legacy->nextRecord < dataBlock->NumRecords) {
+        partBlock->NumRecords = 0;
+        partBlock->size = 0;
+        partBlock->type = DATA_BLOCK_TYPE_2;
+
+        uint32_t v3Size = v3Block->size;
+        uint32_t v3Records = 0;
+        while (legacy->nextRecord < dataBlock->NumRecords) {
+            record_header_t *record = (record_header_t *)(GetCursor(dataBlock) + legacy->offset);
+            if (legacy->offset + sizeof(record_header_t) > dataBlock->size || record->size < sizeof(record_header_t) ||
+                legacy->offset + record->size > dataBlock->size) {
+                LogError("Corrupt data file. Inconsistent block size in '%s'", fileName);
+                exit(255);
+            }
+            uint32_t size = LegacyRecordSize(record, fileName);
+            if (v3Size + size > LEGACY_PARTSIZE) break;
+
+            memcpy(GetCurrentCursor(partBlock), record, record->size);
+            partBlock->size += record->size;
+            partBlock->NumRecords++;
+            v3Size += size;
+            if (record->type != ExtensionMapType) v3Records++;
+
+            legacy->offset += record->size;
+            legacy->nextRecord++;
+        }
+        // V3 block full
+        if (partBlock->NumRecords == 0) break;
+
+        uint32_t numRecords = v3Block->NumRecords;
+        ConvertBlockType2(partBlock, v3Block);
+
+        // the conversion skips records, which it can not convert
+        if (v3Block->NumRecords - numRecords != v3Records) {
+            LogError("Failed to convert nfdump 1.6 records in '%s': %u of %u converted", fileName, v3Block->NumRecords - numRecords,
+                     v3Records);
+            exit(255);
+        }
+    }
+    FreeDataBlock(partBlock);
+    return v3Block;
+}  // End of ConvertLegacyBlock
+
+// read the next data block and convert nfdump 1.6 blocks. Fail on a truncated or corrupt input file
+static dataBlock_t *NextBlock(nffile_t *nffile, uint32_t *blockCount) {
+    while (1) {
+        if (legacyBlock.dataBlock) {
+            dataBlock_t *v3Block = ConvertLegacyBlock(&legacyBlock, nffile->fileName);
+            if (v3Block && v3Block->NumRecords) return v3Block;
+            if (v3Block) {
+                FreeDataBlock(v3Block);
+                continue;
+            }
+            FreeDataBlock(legacyBlock.dataBlock);
+            legacyBlock.dataBlock = NULL;
+        }
+
+        dataBlock_t *dataBlock = ReadBlock(nffile, NULL);
+        if (!dataBlock) {
+            if (*blockCount != nffile->file_header->NumBlocks) {
+                LogError("Failed to read input file '%s': %u of %u blocks read", nffile->fileName, *blockCount,
+                         nffile->file_header->NumBlocks);
+                exit(255);
+            }
+            return NULL;
+        }
+        (*blockCount)++;
+        if (dataBlock->type != DATA_BLOCK_TYPE_2) return dataBlock;
+
+        // nfdump 1.6.x records - the workers anonymize V3 records only
+        legacyBlock = (legacyBlock_t){.dataBlock = dataBlock, .offset = 0, .nextRecord = 0};
+    }
 }  // End of NextBlock
 
 // finish the output file and rename it to finalName, if given
@@ -546,6 +681,7 @@ static void process_data(queue_t *fileList, char *wfile, int verbose, worker_par
                 exit(255);
             }
             if (verbose) printf("  %i Processing %s\r", cnt++, cfile);
+            ResetLegacyMaps();
 
             if (wfile == NULL || nffile_w == NULL) {
                 int len;
@@ -591,7 +727,7 @@ static void process_data(queue_t *fileList, char *wfile, int verbose, worker_par
             blk_count++;
         }
 
-        if ((*dataBlockPtr)->type != DATA_BLOCK_TYPE_2 && (*dataBlockPtr)->type != DATA_BLOCK_TYPE_3) {
+        if ((*dataBlockPtr)->type != DATA_BLOCK_TYPE_3) {
             LogError("Can not anonymize block type %u in '%s'", (*dataBlockPtr)->type, cfile);
             exit(255);
         }
@@ -869,6 +1005,8 @@ int main(int argc, char **argv) {
     sigaddset(&termSignals, SIGTERM);
     sigaddset(&termSignals, SIGINT);
     sigaddset(&termSignals, SIGHUP);
+    // SIGABRT for a failed assertion in the nfdump 1.6 conversion code
+    sigaddset(&termSignals, SIGABRT);
     BlockSignals(1);
 
     queue_t *fileList = SetupInputFileSequence(&flist);
@@ -894,11 +1032,13 @@ int main(int argc, char **argv) {
     // dataBlock is declared here, not inside process_data(), so its lifetime covers the
     // whole time worker threads may still dereference it - up through WaitWorkersDone()
     dataBlock_t *dataBlock = NULL;
+
     atexit(RemovePendingFile);
     struct sigaction act = {.sa_handler = TerminateHandler, .sa_mask = termSignals};
     sigaction(SIGTERM, &act, NULL);
     sigaction(SIGINT, &act, NULL);
     sigaction(SIGHUP, &act, NULL);
+    sigaction(SIGABRT, &act, NULL);
     // a file size limit is a write error
     signal(SIGXFSZ, SIG_IGN);
     BlockSignals(0);

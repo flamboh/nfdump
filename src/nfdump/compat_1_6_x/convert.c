@@ -49,6 +49,11 @@ static void InitCompat16(void) {
     extension_map_list = InitExtensionMaps(NEEDS_EXTENSION_LIST);
 }  // End of InitCompat16
 
+void ResetCompat16(void) {
+    FreeExtensionMaps(extension_map_list);
+    extension_map_list = NULL;
+}  // End of ResetCompat16
+
 static inline int ConvertRecordV2(common_record_t *commonRecord, dataBlock_t *dataBlock) {
     /*
      * v2 blocks are max 1MB. v3 blocks have 2MB.
