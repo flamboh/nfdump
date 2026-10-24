@@ -671,6 +671,8 @@ static int WriteAppendix(nffile_t *nffile) {
     recordHeader->size = sizeof(recordHeader_t) + len + align + 1;
     strcpy(data, nffile->ident);
     data[len] = '\0';
+    // clear the alignment byte - the block buffer is not initialized
+    if (align) data[len + 1] = '\0';
 
     block_header->NumRecords++;
     block_header->size += recordHeader->size;
