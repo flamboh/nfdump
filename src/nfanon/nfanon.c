@@ -68,11 +68,42 @@
 
 #define MAXANONWORKERS 8
 
+// Per worker cache of anonymized addresses. Each anonymization costs one AES
+// block per address bit, and addresses repeat a lot in flow data.
+// Direct mapped, a colliding address overwrites the entry.
+#ifndef ANONCACHE4_BITS
+#define ANONCACHE4_BITS 18
+#endif
+#ifndef ANONCACHE6_BITS
+#define ANONCACHE6_BITS 16
+#endif
+
+#define CACHE_VALID 1
+#define CACHE_ANON 2
+
+typedef struct anonCache4_s {
+    uint32_t addr;
+    uint32_t anon;
+    uint32_t flags;
+} anonCache4_t;
+
+typedef struct anonCache6_s {
+    uint64_t addr[2];
+    uint64_t anon[2];
+    uint32_t flags;
+} anonCache6_t;
+
+typedef struct anonCache_s {
+    anonCache4_t *v4;
+    anonCache6_t *v6;
+} anonCache_t;
+
 typedef struct worker_param_s {
     int self;
     int numWorkers;
     int anon_src;
     int anon_dst;
+    anonCache_t cache;
     dataBlock_t **dataBlock;
 
     // sync barrier
@@ -118,9 +149,9 @@ static void TerminateHandler(int signal);
 
 static void BlockSignals(int block);
 
-static inline int AnonExporterInfo(exporter_info_record_t *exporter_record);
+static inline int AnonExporterInfo(anonCache_t *cache, exporter_info_record_t *exporter_record);
 
-static inline int AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon_dst);
+static inline int AnonRecord(anonCache_t *cache, recordHeaderV3_t *v3Record, int anon_src, int anon_dst);
 
 static int ValidRecordSize(record_header_t *record);
 
@@ -176,22 +207,59 @@ static void BlockSignals(int block) {
     pthread_sigmask(block ? SIG_BLOCK : SIG_UNBLOCK, &termSignals, NULL);
 }  // End of BlockSignals
 
-static inline int AnonIPv4(uint32_t *ip) {
-    if (netList && !NetListMatchV4(netList, *ip)) return 0;
-    *ip = anonymize(*ip);
-    return 1;
+// anonymize ip, if selected. Returns 1 if anonymized, 0 if unchanged
+static inline int AnonIPv4(anonCache_t *cache, uint32_t *ip) {
+#ifndef NFANON_NOCACHE
+    anonCache4_t *entry = &cache->v4[(*ip * 0x9E3779B1u) >> (32 - ANONCACHE4_BITS)];
+    if (entry->flags && entry->addr == *ip) {
+        *ip = entry->anon;
+        return (entry->flags & CACHE_ANON) != 0;
+    }
+#endif
+
+    uint32_t addr = *ip;
+    int anon = netList == NULL || NetListMatchV4(netList, addr);
+    if (anon) *ip = anonymize(addr);
+
+#ifndef NFANON_NOCACHE
+    entry->addr = addr;
+    entry->anon = *ip;
+    entry->flags = CACHE_VALID | (anon ? CACHE_ANON : 0);
+#endif
+    return anon;
 }  // End of AnonIPv4
 
-static inline int AnonIPv6(uint64_t ip[2]) {
-    if (netList && !NetListMatchV6(netList, ip)) return 0;
-    uint64_t anon_ip[2];
-    anonymize_v6(ip, anon_ip);
-    ip[0] = anon_ip[0];
-    ip[1] = anon_ip[1];
-    return 1;
+// the decision for an IPv4-mapped address depends on the full IPv6 address only,
+// so the IPv6 address is a valid cache key
+static inline int AnonIPv6(anonCache_t *cache, uint64_t ip[2]) {
+#ifndef NFANON_NOCACHE
+    uint64_t hash = (ip[0] * 0x9E3779B97F4A7C15ULL) ^ ip[1];
+    hash ^= hash >> 32;
+    hash *= 0xD6E8FEB86659FD93ULL;
+    hash ^= hash >> 32;
+    anonCache6_t *entry = &cache->v6[hash >> (64 - ANONCACHE6_BITS)];
+    if (entry->flags && entry->addr[0] == ip[0] && entry->addr[1] == ip[1]) {
+        ip[0] = entry->anon[0];
+        ip[1] = entry->anon[1];
+        return (entry->flags & CACHE_ANON) != 0;
+    }
+#endif
+
+    uint64_t addr[2] = {ip[0], ip[1]};
+    int anon = netList == NULL || NetListMatchV6(netList, addr);
+    if (anon) anonymize_v6(addr, ip);
+
+#ifndef NFANON_NOCACHE
+    entry->addr[0] = addr[0];
+    entry->addr[1] = addr[1];
+    entry->anon[0] = ip[0];
+    entry->anon[1] = ip[1];
+    entry->flags = CACHE_VALID | (anon ? CACHE_ANON : 0);
+#endif
+    return anon;
 }  // End of AnonIPv6
 
-static inline int AnonExporterInfo(exporter_info_record_t *exporter_record) {
+static inline int AnonExporterInfo(anonCache_t *cache, exporter_info_record_t *exporter_record) {
     const uint8_t prefix[12] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff};
 
     if (exporter_record->header.size != sizeof(exporter_info_record_t)) {
@@ -212,7 +280,7 @@ static inline int AnonExporterInfo(exporter_info_record_t *exporter_record) {
                 uint32_t ipv4;
                 memcpy(&ipv4, ipAddr.bytes + 12, sizeof(uint32_t));
                 ipv4 = ntohl(ipv4);
-                AnonIPv4(&ipv4);
+                AnonIPv4(cache, &ipv4);
                 ipv4 = htonl(ipv4);
                 memcpy(ipAddr.bytes + 12, &ipv4, sizeof(uint32_t));
 
@@ -220,14 +288,14 @@ static inline int AnonExporterInfo(exporter_info_record_t *exporter_record) {
                 // anonymise IPv6
                 u[0] = ntohll(u[0]);
                 u[1] = ntohll(u[1]);
-                AnonIPv6(u);
+                AnonIPv6(cache, u);
                 u[0] = htonll(u[0]);
                 u[1] = htonll(u[1]);
             }
         } break;
         case AF_INET: {  // old IPV4 record
             uint32_t ipv4 = u[1];
-            AnonIPv4(&ipv4);
+            AnonIPv4(cache, &ipv4);
 
             // convert to new representation
             ipv4 = htonl(ipv4);
@@ -241,7 +309,7 @@ static inline int AnonExporterInfo(exporter_info_record_t *exporter_record) {
             // copy back to exporter ip
         } break;
         default: {  // old IPv6 record - like nfdump, take any other address family as IPv6
-            AnonIPv6(u);
+            AnonIPv6(cache, u);
             u[0] = htonll(u[0]);
             u[1] = htonll(u[1]);
 
@@ -279,7 +347,7 @@ static inline int ValidExtensionLength(const elementHeader_t *elementHeader) {
 }  // End of ValidExtensionLength
 
 // anonymize a V3 record. Returns 0, if the record is corrupt
-static inline int AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon_dst) {
+static inline int AnonRecord(anonCache_t *cache, recordHeaderV3_t *v3Record, int anon_src, int anon_dst) {
     elementHeader_t *elementHeader;
 
     void *p = (void *)v3Record;
@@ -320,13 +388,13 @@ static inline int AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon_
                 break;
             case EXipv4FlowID: {
                 EXipv4Flow_t *ipv4Flow = (EXipv4Flow_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                if (anon_src) srcAnon |= AnonIPv4(&ipv4Flow->srcAddr);
-                if (anon_dst) dstAnon |= AnonIPv4(&ipv4Flow->dstAddr);
+                if (anon_src) srcAnon |= AnonIPv4(cache, &ipv4Flow->srcAddr);
+                if (anon_dst) dstAnon |= AnonIPv4(cache, &ipv4Flow->dstAddr);
             } break;
             case EXipv6FlowID: {
                 EXipv6Flow_t *ipv6Flow = (EXipv6Flow_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                if (anon_src) srcAnon |= AnonIPv6(ipv6Flow->srcAddr);
-                if (anon_dst) dstAnon |= AnonIPv6(ipv6Flow->dstAddr);
+                if (anon_src) srcAnon |= AnonIPv6(cache, ipv6Flow->srcAddr);
+                if (anon_dst) dstAnon |= AnonIPv6(cache, ipv6Flow->dstAddr);
             } break;
             case EXflowMiscID:
                 break;
@@ -339,27 +407,27 @@ static inline int AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon_
             } break;
             case EXbgpNextHopV4ID: {
                 EXbgpNextHopV4_t *bgpNextHopV4 = (EXbgpNextHopV4_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                AnonIPv4(&bgpNextHopV4->ip);
+                AnonIPv4(cache, &bgpNextHopV4->ip);
             } break;
             case EXbgpNextHopV6ID: {
                 EXbgpNextHopV6_t *bgpNextHopV6 = (EXbgpNextHopV6_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                AnonIPv6(bgpNextHopV6->ip);
+                AnonIPv6(cache, bgpNextHopV6->ip);
             } break;
             case EXipNextHopV4ID: {
                 EXipNextHopV4_t *ipNextHopV4 = (EXipNextHopV4_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                AnonIPv4(&ipNextHopV4->ip);
+                AnonIPv4(cache, &ipNextHopV4->ip);
             } break;
             case EXipNextHopV6ID: {
                 EXipNextHopV6_t *ipNextHopV6 = (EXipNextHopV6_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                AnonIPv6(ipNextHopV6->ip);
+                AnonIPv6(cache, ipNextHopV6->ip);
             } break;
             case EXipReceivedV4ID: {
                 EXipReceivedV4_t *ipReceived = (EXipReceivedV4_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                AnonIPv4(&ipReceived->ip);
+                AnonIPv4(cache, &ipReceived->ip);
             } break;
             case EXipReceivedV6ID: {
                 EXipReceivedV6_t *ipReceived = (EXipReceivedV6_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                AnonIPv6(ipReceived->ip);
+                AnonIPv6(cache, ipReceived->ip);
             } break;
             case EXmplsLabelID:
                 break;
@@ -374,23 +442,23 @@ static inline int AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon_
                 break;
             case EXnatXlateIPv4ID: {
                 EXnatXlateIPv4_t *natXlateIPv4 = (EXnatXlateIPv4_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                if (anon_src) AnonIPv4(&natXlateIPv4->xlateSrcAddr);
-                if (anon_dst) AnonIPv4(&natXlateIPv4->xlateDstAddr);
+                if (anon_src) AnonIPv4(cache, &natXlateIPv4->xlateSrcAddr);
+                if (anon_dst) AnonIPv4(cache, &natXlateIPv4->xlateDstAddr);
             } break;
             case EXnatXlateIPv6ID: {
                 EXnatXlateIPv6_t *natXlateIPv6 = (EXnatXlateIPv6_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                if (anon_src) AnonIPv6(natXlateIPv6->xlateSrcAddr);
-                if (anon_dst) AnonIPv6(natXlateIPv6->xlateDstAddr);
+                if (anon_src) AnonIPv6(cache, natXlateIPv6->xlateSrcAddr);
+                if (anon_dst) AnonIPv6(cache, natXlateIPv6->xlateDstAddr);
             } break;
             case EXtunIPv4ID: {
                 EXtunIPv4_t *tunIPv4 = (EXtunIPv4_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                if (anon_src) AnonIPv4(&tunIPv4->tunSrcAddr);
-                if (anon_dst) AnonIPv4(&tunIPv4->tunDstAddr);
+                if (anon_src) AnonIPv4(cache, &tunIPv4->tunSrcAddr);
+                if (anon_dst) AnonIPv4(cache, &tunIPv4->tunDstAddr);
             } break;
             case EXtunIPv6ID: {
                 EXtunIPv6_t *tunIPv6 = (EXtunIPv6_t *)((void *)elementHeader + sizeof(elementHeader_t));
-                if (anon_src) AnonIPv6(tunIPv6->tunSrcAddr);
-                if (anon_dst) AnonIPv6(tunIPv6->tunDstAddr);
+                if (anon_src) AnonIPv6(cache, tunIPv6->tunSrcAddr);
+                if (anon_dst) AnonIPv6(cache, tunIPv6->tunDstAddr);
             } break;
             case EXinPayloadID:
             case EXoutPayloadID:
@@ -810,10 +878,10 @@ static void *worker_thread(void *arg) {
                 int ok = 1;
                 switch (record_ptr->type) {
                     case V3Record:
-                        ok = AnonRecord((recordHeaderV3_t *)record_ptr, worker_param->anon_src, worker_param->anon_dst);
+                        ok = AnonRecord(&worker_param->cache, (recordHeaderV3_t *)record_ptr, worker_param->anon_src, worker_param->anon_dst);
                         break;
                     case ExporterInfoRecordType:
-                        ok = AnonExporterInfo((exporter_info_record_t *)record_ptr);
+                        ok = AnonExporterInfo(&worker_param->cache, (exporter_info_record_t *)record_ptr);
                         break;
                     case ExporterStatRecordType:
                     case SamplerLegacyRecordType:
@@ -860,6 +928,8 @@ static void *worker_thread(void *arg) {
     }
 
     dbg_printf("Worker %d done.\n", worker_param->self);
+    free(worker_param->cache.v4);
+    free(worker_param->cache.v6);
     free(worker_param);
     pthread_exit(NULL);
 }  // End of worker_thread
@@ -874,6 +944,13 @@ static worker_param_t **LauchWorkers(pthread_t *tid, int numWorkers, int anon_sr
     for (int i = 0; i < numWorkers; i++) {
         worker_param_t *worker_param = calloc(1, sizeof(worker_param_t));
         if (!worker_param) {
+            LogError("calloc() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
+            return NULL;
+        }
+
+        worker_param->cache.v4 = calloc(1 << ANONCACHE4_BITS, sizeof(anonCache4_t));
+        worker_param->cache.v6 = calloc(1 << ANONCACHE6_BITS, sizeof(anonCache6_t));
+        if (!worker_param->cache.v4 || !worker_param->cache.v6) {
             LogError("calloc() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
             return NULL;
         }
