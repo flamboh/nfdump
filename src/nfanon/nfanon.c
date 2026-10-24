@@ -200,7 +200,7 @@ static inline int AnonExporterInfo(exporter_info_record_t *exporter_record) {
             dbg_printf("Exporter: %s\n", s);
             // copy back to exporter ip
         } break;
-        case AF_INET6: {  // old IPv6 record
+        default: {  // old IPv6 record - like nfdump, take any other address family as IPv6
             anonymize_v6(u, anon_ip);
             u[0] = htonll(anon_ip[0]);
             u[1] = htonll(anon_ip[1]);
