@@ -103,6 +103,7 @@ typedef struct worker_param_s {
     int numWorkers;
     int anon_src;
     int anon_dst;
+    int mark_tos;
     anonCache_t cache;
     dataBlock_t **dataBlock;
 
@@ -151,7 +152,7 @@ static void BlockSignals(int block);
 
 static inline int AnonExporterInfo(anonCache_t *cache, exporter_info_record_t *exporter_record);
 
-static inline int AnonRecord(anonCache_t *cache, recordHeaderV3_t *v3Record, int anon_src, int anon_dst);
+static inline int AnonRecord(anonCache_t *cache, recordHeaderV3_t *v3Record, int anon_src, int anon_dst, int mark_tos);
 
 static int ValidRecordSize(record_header_t *record);
 
@@ -176,6 +177,7 @@ static void usage(char *name) {
         "-s\t\tPreserve source address.\n"
         "-d\t\tPreserve destination address.\n"
         "-N <file>\tAnonymize only addresses in the networks listed in <file>.\n"
+        "-T\t\tMark anonymized sides in the src ToS: bit 1 src, bit 0 dst.\n"
         "-q\t\tDeprecated and rejected; use -v 0 to suppress progress output.\n"
         "-r <path>\tread input from single file or all files in directory.\n"
         "-v level\tSet verbose level.\n"
@@ -381,7 +383,7 @@ static inline int ValidExtensionLength(const elementHeader_t *elementHeader) {
 }  // End of ValidExtensionLength
 
 // anonymize a V3 record. Returns 0, if the record is corrupt
-static inline int AnonRecord(anonCache_t *cache, recordHeaderV3_t *v3Record, int anon_src, int anon_dst) {
+static inline int AnonRecord(anonCache_t *cache, recordHeaderV3_t *v3Record, int anon_src, int anon_dst, int mark_tos) {
     elementHeader_t *elementHeader;
 
     void *p = (void *)v3Record;
@@ -392,8 +394,9 @@ static inline int AnonRecord(anonCache_t *cache, recordHeaderV3_t *v3Record, int
         return 0;
     }
 
-    // extensions are stored in any order. Remember the AS extensions and
+    // extensions are stored in any order. Remember the AS and ToS extensions and
     // update them, after all addresses are processed
+    EXgenericFlow_t *genericFlow = NULL;
     EXasRouting_t *asRouting = NULL;
     EXasAdjacent_t *asAdjacent = NULL;
     int srcAnon = 0;
@@ -418,8 +421,9 @@ static inline int AnonRecord(anonCache_t *cache, recordHeaderV3_t *v3Record, int
                 // nfdump marks an unused IPv4 or IPv6 flow extension as EXnull and keeps its data
                 memset((void *)elementHeader + sizeof(elementHeader_t), 0, elementHeader->length - sizeof(elementHeader_t));
                 break;
-            case EXgenericFlowID:
-                break;
+            case EXgenericFlowID: {
+                genericFlow = (EXgenericFlow_t *)((void *)elementHeader + sizeof(elementHeader_t));
+            } break;
             case EXipv4FlowID: {
                 EXipv4Flow_t *ipv4Flow = (EXipv4Flow_t *)((void *)elementHeader + sizeof(elementHeader_t));
                 if (anon_src) srcAnon |= AnonIPv4(cache, &ipv4Flow->srcAddr);
@@ -533,6 +537,13 @@ static inline int AnonRecord(anonCache_t *cache, recordHeaderV3_t *v3Record, int
             asAdjacent->nextAdjacentAS = 0;
             asAdjacent->prevAdjacentAS = 0;
         }
+    }
+
+    if (mark_tos && genericFlow) {
+        // mark the anonymized sides in the 2 low bits of the src ToS: src 2, dst 1
+        int markSrc = netList ? srcAnon : anon_src;
+        int markDst = netList ? dstAnon : anon_dst;
+        genericFlow->srcTos = (genericFlow->srcTos & 0xfc) | (markSrc ? 2 : 0) | (markDst ? 1 : 0);
     }
 
     return 1;
@@ -912,7 +923,8 @@ static void *worker_thread(void *arg) {
                 int ok = 1;
                 switch (record_ptr->type) {
                     case V3Record:
-                        ok = AnonRecord(&worker_param->cache, (recordHeaderV3_t *)record_ptr, worker_param->anon_src, worker_param->anon_dst);
+                        ok = AnonRecord(&worker_param->cache, (recordHeaderV3_t *)record_ptr, worker_param->anon_src, worker_param->anon_dst,
+                                        worker_param->mark_tos);
                         break;
                     case ExporterInfoRecordType:
                         ok = AnonExporterInfo(&worker_param->cache, (exporter_info_record_t *)record_ptr);
@@ -968,7 +980,8 @@ static void *worker_thread(void *arg) {
     pthread_exit(NULL);
 }  // End of worker_thread
 
-static worker_param_t **LauchWorkers(pthread_t *tid, int numWorkers, int anon_src, int anon_dst, pthread_control_barrier_t *barrier) {
+static worker_param_t **LauchWorkers(pthread_t *tid, int numWorkers, int anon_src, int anon_dst, int mark_tos,
+                                     pthread_control_barrier_t *barrier) {
     worker_param_t **workerList = calloc(numWorkers, sizeof(worker_param_t *));
     if (!workerList) {
         LogError("calloc() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
@@ -993,6 +1006,7 @@ static worker_param_t **LauchWorkers(pthread_t *tid, int numWorkers, int anon_sr
         worker_param->self = i;
         worker_param->anon_src = anon_src;
         worker_param->anon_dst = anon_dst;
+        worker_param->mark_tos = mark_tos;
         worker_param->dataBlock = NULL;
         worker_param->numWorkers = numWorkers;
         workerList[i] = worker_param;
@@ -1033,8 +1047,9 @@ int main(int argc, char **argv) {
     int verbose = -1;
     int anon_src = 1;
     int anon_dst = 1;
+    int mark_tos = 0;
     int c;
-    while ((c = getopt(argc, argv, "C:hsdK:k:N:qr:t:v:w:W:")) != EOF) {
+    while ((c = getopt(argc, argv, "C:hsdK:k:N:qr:Tt:v:w:W:")) != EOF) {
         switch (c) {
             case 'h':
                 usage(argv[0]);
@@ -1071,6 +1086,9 @@ int main(int argc, char **argv) {
             case 'N':
                 CheckArgLen(optarg, MAXPATHLEN);
                 netListFile = optarg;
+                break;
+            case 'T':
+                mark_tos = 1;
                 break;
             case 'q':
                 LogError("Option -q deprecated. Use -v 0");
@@ -1171,7 +1189,7 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
     dbg_printf("Launch Workers\n");
-    worker_param_t **workerList = LauchWorkers(tid, numWorkers, anon_src, anon_dst, barrier);
+    worker_param_t **workerList = LauchWorkers(tid, numWorkers, anon_src, anon_dst, mark_tos, barrier);
     if (!workerList) {
         LogError("Failed to launch workers");
         exit(255);
