@@ -157,6 +157,8 @@ static int ValidRecordSize(record_header_t *record);
 
 static int ParseWorkerCount(const char *arg, int *numWorkers);
 
+static int ReadKeyFile(const char *fileName, char *key);
+
 static void process_data(queue_t *fileList, char *wfile, int verbose, worker_param_t **workerList, int numWorkers,
                          pthread_control_barrier_t *barrier, dataBlock_t **dataBlockPtr);
 
@@ -170,6 +172,7 @@ static void usage(char *name) {
         "-C <file>\tRead optional config file.\n"
         "-h\t\tthis text you see right here.\n"
         "-K <key>\tAnonymize IP addresses using CryptoPAn with key <key>.\n"
+        "-k <file>\tRead the CryptoPAn key from <file> instead of the command line.\n"
         "-s\t\tPreserve source address.\n"
         "-d\t\tPreserve destination address.\n"
         "-N <file>\tAnonymize only addresses in the networks listed in <file>.\n"
@@ -206,6 +209,37 @@ static void TerminateHandler(int signal) {
 static void BlockSignals(int block) {
     pthread_sigmask(block ? SIG_BLOCK : SIG_UNBLOCK, &termSignals, NULL);
 }  // End of BlockSignals
+
+// read the CryptoPAn key from a file. Accepts the same formats as -K
+// and never prints the key
+static int ReadKeyFile(const char *fileName, char *key) {
+    FILE *fp = fopen(fileName, "r");
+    if (!fp) {
+        LogError("Failed to open key file '%s': %s", fileName, strerror(errno));
+        return 0;
+    }
+
+    char buff[128];
+    size_t len = fread(buff, 1, sizeof(buff) - 1, fp);
+    int tooLong = len == sizeof(buff) - 1 && fgetc(fp) != EOF;
+    if (ferror(fp)) {
+        LogError("Failed to read key file '%s': %s", fileName, strerror(errno));
+        fclose(fp);
+        return 0;
+    }
+    fclose(fp);
+
+    buff[len] = '\0';
+    while (len > 0 && isspace((unsigned char)buff[len - 1])) buff[--len] = '\0';
+
+    if (tooLong || strlen(buff) != len || !ParseCryptoPAnKey(buff, key)) {
+        LogError("Invalid CryptoPAn key in file '%s'. Need either a plain 32 char string, or a 32 byte hex key starting with 0x", fileName);
+        memset(buff, 0, sizeof(buff));
+        return 0;
+    }
+    memset(buff, 0, sizeof(buff));
+    return 1;
+}  // End of ReadKeyFile
 
 // anonymize ip, if selected. Returns 1 if anonymized, 0 if unchanged
 static inline int AnonIPv4(anonCache_t *cache, uint32_t *ip) {
@@ -993,12 +1027,14 @@ int main(int argc, char **argv) {
 
     char *configFile = NULL;
     char *netListFile = NULL;
+    char *keyFile = NULL;
+    int haveKey = 0;
     int numWorkers = 0;
     int verbose = -1;
     int anon_src = 1;
     int anon_dst = 1;
     int c;
-    while ((c = getopt(argc, argv, "C:hsdK:N:qr:t:v:w:W:")) != EOF) {
+    while ((c = getopt(argc, argv, "C:hsdK:k:N:qr:t:v:w:W:")) != EOF) {
         switch (c) {
             case 'h':
                 usage(argv[0]);
@@ -1020,6 +1056,11 @@ int main(int argc, char **argv) {
                     exit(255);
                 }
                 PAnonymizer_Init((uint8_t *)CryptoPAnKey);
+                haveKey = 1;
+                break;
+            case 'k':
+                CheckArgLen(optarg, MAXPATHLEN);
+                keyFile = optarg;
                 break;
             case 's':
                 anon_src = 0;
@@ -1077,8 +1118,18 @@ int main(int argc, char **argv) {
         exit(EXIT_FAILURE);
     }
 
-    if (CryptoPAnKey[0] == '\0') {
-        LogError("Expect -K <key>");
+    if (keyFile) {
+        if (haveKey) {
+            LogError("Use either -K <key> or -k <file>, not both");
+            exit(255);
+        }
+        if (!ReadKeyFile(keyFile, CryptoPAnKey)) exit(255);
+        PAnonymizer_Init((uint8_t *)CryptoPAnKey);
+        haveKey = 1;
+    }
+
+    if (!haveKey) {
+        LogError("Expect -K <key> or -k <file>");
         usage(argv[0]);
         exit(255);
     }

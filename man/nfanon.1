@@ -35,7 +35,7 @@
 .Nm 
 .Fl r Ar path
 .Op Fl w Ar nffile
-.Fl K Ar key
+.Fl K Ar key | Fl k Ar file
 .Op Fl C Ar config
 .Op Fl s
 .Op Fl d
@@ -91,6 +91,17 @@ may name the input file, or a hard or symbolic link to it.
 .Ar key
 is either a 32 character string, or a 64 char hex string starting with 0x. This key
 is used to initialize the anonymizer.
+.It Fl k Ar file
+Read the key from
+.Ar file
+instead of the command line, where every local user can see it in the process
+list. The file contains the key in the same format as for
+.Fl K ,
+trailing white space and newlines are ignored.
+.Fl K
+and
+.Fl k
+are mutually exclusive.
 .It Fl v Ar level
 Set verbose level. A verbose level of 0 disables the activity spinner.
 .It Fl W Ar num
