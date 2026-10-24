@@ -40,6 +40,7 @@
 .Op Fl s
 .Op Fl d
 .Op Fl N Ar file
+.Op Fl T
 .Op Fl q
 .Op Fl t Ar num
 .Op Fl v Ar level
@@ -143,6 +144,17 @@ networks. A mapped network ::ffff:a.b.c.d/n with n >= 96 in
 is the IPv4 network a.b.c.d/n-96. An IPv6 network, which covers the mapped
 range without being part of it, such as ::/0, applies to the other IPv6
 addresses only.
+.It Fl T
+Mark the anonymized sides of each flow in the two low bits of the source ToS
+byte. The bits are cleared, then bit 1 (value 2) is set if the source address
+was anonymized, bit 0 (value 1) if the destination address was. Without
+.Fl N
+every side not preserved by
+.Fl s
+or
+.Fl d
+counts as anonymized. Only the source and destination flow addresses set the
+bits. Records without a ToS field are not marked.
 .It Fl q
 Deprecated compatibility option; it is rejected. Use
 .Fl v 0
