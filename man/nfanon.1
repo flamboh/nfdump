@@ -117,8 +117,18 @@ Print help text to stdout and exit.
 .El
 .Sh EXIT STATUS
 .Nm
-returns 0 on success and 255 otherwise. An output file that can not be written
-completely, for example on a full disk, is an error and is removed.
+returns 0 on success, and 1 or 255 otherwise. Any error is fatal: a record or block
+that can not be anonymized, a corrupt, truncated or unreadable input file, or an
+output file that can not be written completely, for example on a full disk.
+.Pp
+On a fatal error, and when terminated by SIGTERM, SIGINT or SIGHUP,
+.Nm
+removes the incomplete output file and never replaces an input file in place.
+Other signals, such as SIGKILL, may leave an incomplete output file or a
+temporary file ending in -tmp behind, but never replace an input file. Use the
+output file only if
+.Nm
+returned 0.
 .Sh EXAMPLES
 To create a random 64 character hex string you may use the following command:
 .Dl % xxd -u -l 32 -p -c 64 /dev/urandom

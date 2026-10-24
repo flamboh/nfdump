@@ -38,6 +38,7 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -75,17 +76,34 @@ typedef struct worker_param_s {
     pthread_control_barrier_t *barrier;
 } worker_param_t;
 
+// set by the workers, if a record can not be anonymized
+static atomic_int anonError = 0;
+
+// output file being written. Removed, if nfanon exits before it is complete
+static char pendingFile[MAXPATHLEN] = {0};
+
+// signals, which remove the pending file. Only the main thread handles them
+static sigset_t termSignals;
+
 /* Function Prototypes */
 static void usage(char *name);
 
-static inline void AnonExporterInfo(exporter_info_record_t *exporter_record);
+static void RemovePendingFile(void);
 
-static inline void AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon_dst);
+static void TerminateHandler(int signal);
+
+static void BlockSignals(int block);
+
+static inline int AnonExporterInfo(exporter_info_record_t *exporter_record);
+
+static inline int AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon_dst);
+
+static int ValidRecordSize(record_header_t *record);
 
 static int ParseWorkerCount(const char *arg, int *numWorkers);
 
-static void process_data(char *wfile, int verbose, worker_param_t **workerList, int numWorkers, pthread_control_barrier_t *barrier,
-                          dataBlock_t **dataBlockPtr);
+static void process_data(queue_t *fileList, char *wfile, int verbose, worker_param_t **workerList, int numWorkers,
+                         pthread_control_barrier_t *barrier, dataBlock_t **dataBlockPtr);
 
 /* Functions */
 
@@ -118,12 +136,27 @@ static int ParseWorkerCount(const char *arg, int *numWorkers) {
     return 1;
 }  // End of ParseWorkerCount
 
-static inline void AnonExporterInfo(exporter_info_record_t *exporter_record) {
+static void RemovePendingFile(void) {
+    if (pendingFile[0]) unlink(pendingFile);
+}  // End of RemovePendingFile
+
+static void TerminateHandler(int signal) {
+    (void)signal;
+    RemovePendingFile();
+    _exit(255);
+}  // End of TerminateHandler
+
+// block the signals while the pending file is created or renamed
+static void BlockSignals(int block) {
+    pthread_sigmask(block ? SIG_BLOCK : SIG_UNBLOCK, &termSignals, NULL);
+}  // End of BlockSignals
+
+static inline int AnonExporterInfo(exporter_info_record_t *exporter_record) {
     const uint8_t prefix[12] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff, 0xff};
 
     if (exporter_record->header.size != sizeof(exporter_info_record_t)) {
         LogError("Corrupt exporter record in %s line %d", __FILE__, __LINE__);
-        return;
+        return 0;
     }
 
     uint64_t anon_ip[2];
@@ -184,30 +217,58 @@ static inline void AnonExporterInfo(exporter_info_record_t *exporter_record) {
     printf("Exporter: %s\n", s);
 #endif
 
+    return 1;
 }  // End of AnonExporterInfo
 
-static inline void AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon_dst) {
+// a fixed size extension must have exactly its size, as nfanon copies any surplus bytes
+// unmodified. A variable length extension holds at least its fixed part
+static inline int ValidExtensionLength(const elementHeader_t *elementHeader) {
+    switch (elementHeader->type) {
+        case EXnull:
+        case EXnbarAppID:
+        case EXlabelID:
+        case EXinPayloadID:
+        case EXoutPayloadID:
+        case EXinmonFrameID:
+        case EXpfinfoID:
+        case EXnokiaNatStringID:
+            return elementHeader->length >= extensionTable[elementHeader->type].size;
+        default:
+            return elementHeader->length == extensionTable[elementHeader->type].size;
+    }
+}  // End of ValidExtensionLength
+
+// anonymize a V3 record. Returns 0, if the record is corrupt
+static inline int AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon_dst) {
     elementHeader_t *elementHeader;
-    uint32_t size = sizeof(recordHeaderV3_t);
 
     void *p = (void *)v3Record;
     void *eor = p + v3Record->size;
 
-    if (v3Record->size < size) {
+    if (v3Record->size < sizeof(recordHeaderV3_t)) {
         LogError("v3Record - unexpected size: '%u'", v3Record->size);
-        return;
+        return 0;
     }
 
     SetFlag(v3Record->flags, V3_FLAG_ANON);
     dbg_printf("Record announces %u extensions with total size %u\n", v3Record->numElements, v3Record->size);
     // first record header
     elementHeader = (elementHeader_t *)(p + sizeof(recordHeaderV3_t));
-    for (int i = 0; i < v3Record->numElements; i++) {
+    int i;
+    for (i = 0; i < v3Record->numElements; i++) {
         uint64_t anon_ip[2];
-        dbg_printf("[%i] next extension: %u: %s\n", i, elementHeader->type,
-                   elementHeader->type < MAXEXTENSIONS ? extensionTable[elementHeader->type].name : "<unknown>");
+        // the extension must lie within the record and have the size of its type.
+        // An unknown extension may hold addresses
+        if ((void *)elementHeader + sizeof(elementHeader_t) > eor || elementHeader->type >= MAXEXTENSIONS ||
+            elementHeader->length < sizeof(elementHeader_t) || !ValidExtensionLength(elementHeader) ||
+            (void *)elementHeader + elementHeader->length > eor) {
+            goto CORRUPT;
+        }
+        dbg_printf("[%i] next extension: %u: %s\n", i, elementHeader->type, extensionTable[elementHeader->type].name);
         switch (elementHeader->type) {
             case EXnull:
+                // nfdump marks an unused IPv4 or IPv6 flow extension as EXnull and keeps its data
+                memset((void *)elementHeader + sizeof(elementHeader_t), 0, elementHeader->length - sizeof(elementHeader_t));
                 break;
             case EXgenericFlowID:
                 break;
@@ -325,21 +386,26 @@ static inline void AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon
             case EXinmonFrameID:
                 // raw packet data contains addresses in arbitrary places - clear it
                 // but keep the extension and its length
-                if (elementHeader->length > sizeof(elementHeader_t) && (void *)elementHeader + elementHeader->length <= eor)
-                    memset((void *)elementHeader + sizeof(elementHeader_t), 0, elementHeader->length - sizeof(elementHeader_t));
+                memset((void *)elementHeader + sizeof(elementHeader_t), 0, elementHeader->length - sizeof(elementHeader_t));
                 break;
                 // default:
                 // skip other and unknown extension
         }
 
-        size += elementHeader->length;
         elementHeader = (elementHeader_t *)((void *)elementHeader + elementHeader->length);
-
-        if ((void *)elementHeader > eor) {
-            LogError("ptr error - elementHeader > eor");
-            exit(255);
-        }
     }
+
+    // bytes after the last extension would be copied unmodified
+    if ((void *)elementHeader != eor) {
+        LogError("Corrupt record: %u bytes after %u extensions", (unsigned)(eor - (void *)elementHeader), v3Record->numElements);
+        return 0;
+    }
+
+    return 1;
+
+CORRUPT:
+    LogError("Corrupt record: extension %d of %u invalid", i + 1, v3Record->numElements);
+    return 0;
 
 }  // End of AnonRecord
 
@@ -356,25 +422,74 @@ static void CheckInputAlias(nffile_t *nffile, const char *outFile) {
     }
 }  // End of CheckInputAlias
 
-// finish the output file and rename it to finalName, if given. Remove it, if it is incomplete
-static int CloseOutputFile(nffile_t *nffile, const char *outFile, const char *finalName) {
+// size of a record without addresses, which has a fixed layout
+static int ValidRecordSize(record_header_t *record) {
+    uint64_t size = 0;
+    switch (record->type) {
+        case ExporterStatRecordType: {
+            exporter_stats_record_t *stats = (exporter_stats_record_t *)record;
+            if (record->size < sizeof(exporter_stats_record_t) || stats->stat_count == 0) break;
+            size = sizeof(exporter_stats_record_t) + (uint64_t)(stats->stat_count - 1) * sizeof(struct exporter_stat_s);
+        } break;
+        case SamplerLegacyRecordType:
+            size = sizeof(samplerV0_record_t);
+            break;
+        case SamplerRecordType:
+            size = sizeof(sampler_record_t);
+            break;
+    }
+    if (record->size == size) return 1;
+
+    LogError("Corrupt record type %u with size %u", record->type, record->size);
+    return 0;
+}  // End of ValidRecordSize
+
+// open the next input file. Unlike GetNextFile(), fail on a file, which can not be opened
+static nffile_t *OpenNextFile(queue_t *fileList) {
+    char *fileName = queue_pop(fileList);
+    if (fileName == QUEUE_CLOSED) return NULL;
+
+    nffile_t *nffile = OpenFile(fileName);
+    if (!nffile) {
+        LogError("Failed to open input file '%s'", fileName);
+        exit(255);
+    }
+    free(fileName);
+    return nffile;
+}  // End of OpenNextFile
+
+// read the next data block. Fail on a truncated or corrupt input file
+static dataBlock_t *NextBlock(nffile_t *nffile, uint32_t *blockCount) {
+    dataBlock_t *dataBlock = ReadBlock(nffile, NULL);
+    if (dataBlock) {
+        (*blockCount)++;
+    } else if (*blockCount != nffile->file_header->NumBlocks) {
+        LogError("Failed to read input file '%s': %u of %u blocks read", nffile->fileName, *blockCount, nffile->file_header->NumBlocks);
+        exit(255);
+    }
+    return dataBlock;
+}  // End of NextBlock
+
+// finish the output file and rename it to finalName, if given
+static void CloseOutputFile(nffile_t *nffile, const char *outFile, const char *finalName) {
     if (!FlushFile(nffile)) {
         LogError("Failed to write output file '%s'", outFile);
-        DisposeFile(nffile);
-        unlink(outFile);
-        return 0;
+        exit(255);
     }
     DisposeFile(nffile);
 
+    BlockSignals(1);
     if (finalName && rename(outFile, finalName) < 0) {
         LogError("rename() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
-        return 0;
+        exit(255);
     }
-    return 1;
+    pendingFile[0] = '\0';
+    BlockSignals(0);
 }  // End of CloseOutputFile
 
-static void process_data(char *wfile, int verbose, worker_param_t **workerList, int numWorkers, pthread_control_barrier_t *barrier,
-                          dataBlock_t **dataBlockPtr) {
+// all errors are fatal: nfanon exits and RemovePendingFile() removes the incomplete output file
+static void process_data(queue_t *fileList, char *wfile, int verbose, worker_param_t **workerList, int numWorkers,
+                         pthread_control_barrier_t *barrier, dataBlock_t **dataBlockPtr) {
     const char spinner[4] = {'|', '/', '-', '\\'};
     char outFile[MAXPATHLEN];
     char *cfile = NULL;
@@ -382,6 +497,7 @@ static void process_data(char *wfile, int verbose, worker_param_t **workerList, 
     int replaceOutput = 0;
 
     int cnt = 1;
+    uint32_t blockCount = 0;
     nffile_t *nffile_r = NULL;
     nffile_t *nffile_w = NULL;
 
@@ -408,15 +524,15 @@ static void process_data(char *wfile, int verbose, worker_param_t **workerList, 
             /* Without -w, finish and replace each input file separately.
              * With -w, keep the writer open and append every input file. */
             if (nffile_w && wfile == NULL) {
-                if (!CloseOutputFile(nffile_w, outFile, cfile)) exit(255);
+                CloseOutputFile(nffile_w, outFile, cfile);
                 nffile_w = NULL;
             }
 
             if (nffile_r) DisposeFile(nffile_r);
-            nffile_r = GetNextFile();
+            nffile_r = OpenNextFile(fileList);
             if (nffile_r == NULL) {
                 if (nffile_w) {
-                    if (!CloseOutputFile(nffile_w, outFile, replaceOutput ? wfile : NULL)) exit(255);
+                    CloseOutputFile(nffile_w, outFile, replaceOutput ? wfile : NULL);
                     nffile_w = NULL;
                 }
                 done = 1;
@@ -427,8 +543,7 @@ static void process_data(char *wfile, int verbose, worker_param_t **workerList, 
             cfile = nffile_r->fileName;
             if (!cfile) {
                 LogError("(NULL) input file name error in %s line %d", __FILE__, __LINE__);
-                DisposeFile(nffile_r);
-                return;
+                exit(255);
             }
             if (verbose) printf("  %i Processing %s\r", cnt++, cfile);
 
@@ -449,12 +564,14 @@ static void process_data(char *wfile, int verbose, worker_param_t **workerList, 
                 }
                 CheckInputAlias(nffile_r, outFile);
 
+                BlockSignals(1);
                 nffile_w = OpenNewFile(outFile, CREATOR_NFANON, FILE_COMPRESSION(nffile_r), NOT_ENCRYPTED);
                 if (!nffile_w) {
                     // can not create output file
-                    DisposeFile(nffile_r);
-                    return;
+                    exit(255);
                 }
+                snprintf(pendingFile, sizeof(pendingFile), "%s", outFile);
+                BlockSignals(0);
 
                 SetIdent(nffile_w, FILE_IDENT(nffile_r));
                 memcpy(nffile_w->stat_record, nffile_r->stat_record, sizeof(stat_record_t));
@@ -464,7 +581,8 @@ static void process_data(char *wfile, int verbose, worker_param_t **workerList, 
             }
 
             // read first block from next file
-            nextBlock = ReadBlock(nffile_r, NULL);
+            blockCount = 0;
+            nextBlock = NextBlock(nffile_r, &blockCount);
             continue;
         }
 
@@ -474,10 +592,8 @@ static void process_data(char *wfile, int verbose, worker_param_t **workerList, 
         }
 
         if ((*dataBlockPtr)->type != DATA_BLOCK_TYPE_2 && (*dataBlockPtr)->type != DATA_BLOCK_TYPE_3) {
-            LogError("Can't process block type %u. Write block unmodified", (*dataBlockPtr)->type);
-            *dataBlockPtr = WriteBlock(nffile_w, *dataBlockPtr);
-            nextBlock = ReadBlock(nffile_r, NULL);
-            continue;
+            LogError("Can not anonymize block type %u in '%s'", (*dataBlockPtr)->type, cfile);
+            exit(255);
         }
 
         dbg_printf("Next block: %d, Records: %u\n", blk_count, (*dataBlockPtr)->NumRecords);
@@ -485,15 +601,19 @@ static void process_data(char *wfile, int verbose, worker_param_t **workerList, 
         pthread_control_barrier_release(barrier);
 
         // prefetch next block
-        nextBlock = ReadBlock(nffile_r, NULL);
+        nextBlock = NextBlock(nffile_r, &blockCount);
 
         // wait for all workers, work done on previous block
         pthread_controller_wait(barrier);
 
+        if (atomic_load(&anonError)) {
+            LogError("Failed to anonymize '%s'", cfile);
+            exit(255);
+        }
+
         // write modified block
         if (!FlushBlock(nffile_w, *dataBlockPtr)) {
             LogError("Failed to write output file '%s'", outFile);
-            unlink(outFile);
             exit(255);
         }
 
@@ -524,9 +644,11 @@ static void *worker_thread(void *arg) {
 
         record_header_t *record_ptr = GetCursor(dataBlock);
         uint32_t sumSize = 0;
-        for (int i = 0; i < (int)dataBlock->NumRecords; i++) {
-            if ((sumSize + record_ptr->size) > dataBlock->size || (record_ptr->size < sizeof(record_header_t))) {
+        for (uint32_t i = 0; i < dataBlock->NumRecords; i++) {
+            if ((sumSize + sizeof(record_header_t)) > dataBlock->size || (sumSize + record_ptr->size) > dataBlock->size ||
+                (record_ptr->size < sizeof(record_header_t))) {
                 LogError("Corrupt data file. Inconsistent block size in %s line %d", __FILE__, __LINE__);
+                atomic_store(&anonError, 1);
                 goto SKIP;
             }
             sumSize += record_ptr->size;
@@ -537,22 +659,49 @@ static void *worker_thread(void *arg) {
                 recordCount++;
 
                 // work on our record
+                int ok = 1;
                 switch (record_ptr->type) {
                     case V3Record:
-                        AnonRecord((recordHeaderV3_t *)record_ptr, worker_param->anon_src, worker_param->anon_dst);
+                        ok = AnonRecord((recordHeaderV3_t *)record_ptr, worker_param->anon_src, worker_param->anon_dst);
                         break;
                     case ExporterInfoRecordType:
-                        AnonExporterInfo((exporter_info_record_t *)record_ptr);
-
-                    default: {
-                        // Silently skip unknown records
-                    }
+                        ok = AnonExporterInfo((exporter_info_record_t *)record_ptr);
+                        break;
+                    case ExporterStatRecordType:
+                    case SamplerLegacyRecordType:
+                    case SamplerRecordType:
+                        // records without addresses. Surplus bytes would be copied unmodified
+                        ok = ValidRecordSize(record_ptr);
+                        break;
+                    case NbarRecordType:
+                    case IfNameRecordType:
+                    case VrfNameRecordType:
+                        // names without addresses
+                        break;
+                    case SlackRecord:
+                        memset((void *)record_ptr + sizeof(record_header_t), 0, record_ptr->size - sizeof(record_header_t));
+                        break;
+                    default:
+                        // a record, which can not be anonymized must not be written
+                        LogError("Can not anonymize record type %u", record_ptr->type);
+                        ok = 0;
+                }
+                if (!ok) {
+                    atomic_store(&anonError, 1);
+                    goto SKIP;
                 }
             }
             // Advance pointer by number of bytes for netflow record
             record_ptr = (record_header_t *)((void *)record_ptr + record_ptr->size);
 
         }  // for all records
+
+        // bytes after the last record would be written unmodified
+        if (sumSize != dataBlock->size) {
+            LogError("Corrupt data file. %u bytes after %u records in %s line %d", dataBlock->size - sumSize, dataBlock->NumRecords, __FILE__,
+                     __LINE__);
+            atomic_store(&anonError, 1);
+        }
 
         dbg_printf("Worker %i: datablock completed. Records processed: %u\n", self, recordCount);
 
@@ -690,7 +839,7 @@ int main(int argc, char **argv) {
                 break;
             default:
                 usage(argv[0]);
-                exit(0);
+                exit(255);
         }
     }
 
@@ -715,6 +864,13 @@ int main(int argc, char **argv) {
     // check numWorkers depending on cores online
     numWorkers = GetNumWorkers(numWorkers);
 
+    // all threads but the main thread block the signals, which remove the pending file
+    sigemptyset(&termSignals);
+    sigaddset(&termSignals, SIGTERM);
+    sigaddset(&termSignals, SIGINT);
+    sigaddset(&termSignals, SIGHUP);
+    BlockSignals(1);
+
     queue_t *fileList = SetupInputFileSequence(&flist);
     if (!fileList || !Init_nffile(numWorkers, fileList)) exit(255);
 
@@ -738,9 +894,15 @@ int main(int argc, char **argv) {
     // dataBlock is declared here, not inside process_data(), so its lifetime covers the
     // whole time worker threads may still dereference it - up through WaitWorkersDone()
     dataBlock_t *dataBlock = NULL;
+    atexit(RemovePendingFile);
+    struct sigaction act = {.sa_handler = TerminateHandler, .sa_mask = termSignals};
+    sigaction(SIGTERM, &act, NULL);
+    sigaction(SIGINT, &act, NULL);
+    sigaction(SIGHUP, &act, NULL);
     // a file size limit is a write error
     signal(SIGXFSZ, SIG_IGN);
-    process_data(wfile, verbose, workerList, numWorkers, barrier, &dataBlock);
+    BlockSignals(0);
+    process_data(fileList, wfile, verbose, workerList, numWorkers, barrier, &dataBlock);
 
     WaitWorkersDone(tid, numWorkers);
     pthread_control_barrier_destroy(barrier);
