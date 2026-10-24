@@ -301,6 +301,32 @@ static inline void AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon
                     natXlateIPv6->xlateDstAddr[1] = anon_ip[1];
                 }
             } break;
+            case EXtunIPv4ID: {
+                EXtunIPv4_t *tunIPv4 = (EXtunIPv4_t *)((void *)elementHeader + sizeof(elementHeader_t));
+                if (anon_src) tunIPv4->tunSrcAddr = anonymize(tunIPv4->tunSrcAddr);
+                if (anon_dst) tunIPv4->tunDstAddr = anonymize(tunIPv4->tunDstAddr);
+            } break;
+            case EXtunIPv6ID: {
+                EXtunIPv6_t *tunIPv6 = (EXtunIPv6_t *)((void *)elementHeader + sizeof(elementHeader_t));
+                if (anon_src) {
+                    anonymize_v6(tunIPv6->tunSrcAddr, anon_ip);
+                    tunIPv6->tunSrcAddr[0] = anon_ip[0];
+                    tunIPv6->tunSrcAddr[1] = anon_ip[1];
+                }
+                if (anon_dst) {
+                    anonymize_v6(tunIPv6->tunDstAddr, anon_ip);
+                    tunIPv6->tunDstAddr[0] = anon_ip[0];
+                    tunIPv6->tunDstAddr[1] = anon_ip[1];
+                }
+            } break;
+            case EXinPayloadID:
+            case EXoutPayloadID:
+            case EXinmonFrameID:
+                // raw packet data contains addresses in arbitrary places - clear it
+                // but keep the extension and its length
+                if (elementHeader->length > sizeof(elementHeader_t) && (void *)elementHeader + elementHeader->length <= eor)
+                    memset((void *)elementHeader + sizeof(elementHeader_t), 0, elementHeader->length - sizeof(elementHeader_t));
+                break;
                 // default:
                 // skip other and unknown extension
         }
