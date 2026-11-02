@@ -343,6 +343,19 @@ static inline void AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon
 
 }  // End of AnonRecord
 
+// fail, if the input file is the output file
+static void CheckInputAlias(nffile_t *nffile, const char *outFile) {
+    struct stat in, out;
+    if (fstat(nffile->fd, &in) < 0) {
+        LogError("fstat() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
+        exit(255);
+    }
+    if (stat(outFile, &out) == 0 && in.st_dev == out.st_dev && in.st_ino == out.st_ino) {
+        LogError("Input file '%s' is the output file '%s'", nffile->fileName, outFile);
+        exit(255);
+    }
+}  // End of CheckInputAlias
+
 // finish the output file and rename it to finalName, if given. Remove it, if it is incomplete
 static int CloseOutputFile(nffile_t *nffile, const char *outFile, const char *finalName) {
     if (!FlushFile(nffile)) {
@@ -365,6 +378,8 @@ static void process_data(char *wfile, int verbose, worker_param_t **workerList, 
     const char spinner[4] = {'|', '/', '-', '\\'};
     char outFile[MAXPATHLEN];
     char *cfile = NULL;
+    // -w names an existing file. Write a new file and replace it, when complete
+    int replaceOutput = 0;
 
     int cnt = 1;
     nffile_t *nffile_r = NULL;
@@ -401,7 +416,7 @@ static void process_data(char *wfile, int verbose, worker_param_t **workerList, 
             nffile_r = GetNextFile();
             if (nffile_r == NULL) {
                 if (nffile_w) {
-                    if (!CloseOutputFile(nffile_w, outFile, NULL)) exit(255);
+                    if (!CloseOutputFile(nffile_w, outFile, replaceOutput ? wfile : NULL)) exit(255);
                     nffile_w = NULL;
                 }
                 done = 1;
@@ -418,12 +433,21 @@ static void process_data(char *wfile, int verbose, worker_param_t **workerList, 
             if (verbose) printf("  %i Processing %s\r", cnt++, cfile);
 
             if (wfile == NULL || nffile_w == NULL) {
+                int len;
                 if (wfile == NULL) {
                     // prepare output file
-                    snprintf(outFile, sizeof(outFile), "%s-tmp", cfile);
+                    len = snprintf(outFile, sizeof(outFile), "%s-tmp", cfile);
                 } else {
-                    snprintf(outFile, sizeof(outFile), "%s", wfile);
+                    // never write into an existing file, which may be an input file
+                    struct stat st;
+                    replaceOutput = stat(wfile, &st) == 0 && S_ISREG(st.st_mode);
+                    len = snprintf(outFile, sizeof(outFile), replaceOutput ? "%s-tmp" : "%s", wfile);
                 }
+                if (len < 0 || len >= (int)sizeof(outFile)) {
+                    LogError("Output file name too long");
+                    exit(255);
+                }
+                CheckInputAlias(nffile_r, outFile);
 
                 nffile_w = OpenNewFile(outFile, CREATOR_NFANON, FILE_COMPRESSION(nffile_r), NOT_ENCRYPTED);
                 if (!nffile_w) {
@@ -435,6 +459,7 @@ static void process_data(char *wfile, int verbose, worker_param_t **workerList, 
                 SetIdent(nffile_w, FILE_IDENT(nffile_r));
                 memcpy(nffile_w->stat_record, nffile_r->stat_record, sizeof(stat_record_t));
             } else {
+                CheckInputAlias(nffile_r, outFile);
                 SumStatRecords(nffile_w->stat_record, nffile_r->stat_record);
             }
 

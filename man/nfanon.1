@@ -75,6 +75,17 @@ containing many flow files.
 .It Fl w Ar nffile
 File name to write anonymized flow records to. If this argument is missing, the source
 file name is taken, which means the original file is overwritten.
+If
+.Ar nffile
+exists,
+.Nm
+writes into
+.Ar nffile Ns -tmp
+and renames it to
+.Ar nffile
+when complete. An existing file is replaced, never written into, so
+.Ar nffile
+may name the input file, or a hard or symbolic link to it.
 .It Fl K Ar key
 .Ar key
 is either a 32 character string, or a 64 char hex string starting with 0x. This key
