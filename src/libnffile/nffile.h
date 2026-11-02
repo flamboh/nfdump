@@ -190,6 +190,7 @@ typedef struct nffile_s {
 
     queue_t *processQueue;  // blocks ready to be processed. Connects consumer/producer threads
     pthread_mutex_t wlock;  // writer lock
+    _Atomic int writeError; // a writer failed - the file is incomplete
     pthread_t worker[];     // nfread/nfwrite worker thread;
 } nffile_t;
 
@@ -275,7 +276,7 @@ dataBlock_t *ReadBlock(nffile_t *nffile, dataBlock_t *dataBlock);
 
 dataBlock_t *WriteBlock(nffile_t *nffile, dataBlock_t *dataBlock);
 
-void FlushBlock(nffile_t *nffile, dataBlock_t *dataBlock);
+int FlushBlock(nffile_t *nffile, dataBlock_t *dataBlock);
 
 void SetIdent(nffile_t *nffile, char *Ident);
 

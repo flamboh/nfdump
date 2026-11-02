@@ -106,7 +106,8 @@ Print help text to stdout and exit.
 .El
 .Sh EXIT STATUS
 .Nm
-returns 0 on success and 255 otherwise.
+returns 0 on success and 255 otherwise. An output file that can not be written
+completely, for example on a full disk, is an error and is removed.
 .Sh EXAMPLES
 To create a random 64 character hex string you may use the following command:
 .Dl % xxd -u -l 32 -p -c 64 /dev/urandom

@@ -36,6 +36,7 @@
 #include <limits.h>
 #include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -342,6 +343,23 @@ static inline void AnonRecord(recordHeaderV3_t *v3Record, int anon_src, int anon
 
 }  // End of AnonRecord
 
+// finish the output file and rename it to finalName, if given. Remove it, if it is incomplete
+static int CloseOutputFile(nffile_t *nffile, const char *outFile, const char *finalName) {
+    if (!FlushFile(nffile)) {
+        LogError("Failed to write output file '%s'", outFile);
+        DisposeFile(nffile);
+        unlink(outFile);
+        return 0;
+    }
+    DisposeFile(nffile);
+
+    if (finalName && rename(outFile, finalName) < 0) {
+        LogError("rename() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
+        return 0;
+    }
+    return 1;
+}  // End of CloseOutputFile
+
 static void process_data(char *wfile, int verbose, worker_param_t **workerList, int numWorkers, pthread_control_barrier_t *barrier,
                           dataBlock_t **dataBlockPtr) {
     const char spinner[4] = {'|', '/', '-', '\\'};
@@ -375,21 +393,15 @@ static void process_data(char *wfile, int verbose, worker_param_t **workerList, 
             /* Without -w, finish and replace each input file separately.
              * With -w, keep the writer open and append every input file. */
             if (nffile_w && wfile == NULL) {
-                FlushFile(nffile_w);
-                DisposeFile(nffile_w);
+                if (!CloseOutputFile(nffile_w, outFile, cfile)) exit(255);
                 nffile_w = NULL;
-                if (rename(outFile, cfile) < 0) {
-                    LogError("rename() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
-                    return;
-                }
             }
 
             if (nffile_r) DisposeFile(nffile_r);
             nffile_r = GetNextFile();
             if (nffile_r == NULL) {
                 if (nffile_w) {
-                    FlushFile(nffile_w);
-                    DisposeFile(nffile_w);
+                    if (!CloseOutputFile(nffile_w, outFile, NULL)) exit(255);
                     nffile_w = NULL;
                 }
                 done = 1;
@@ -454,7 +466,11 @@ static void process_data(char *wfile, int verbose, worker_param_t **workerList, 
         pthread_controller_wait(barrier);
 
         // write modified block
-        FlushBlock(nffile_w, *dataBlockPtr);
+        if (!FlushBlock(nffile_w, *dataBlockPtr)) {
+            LogError("Failed to write output file '%s'", outFile);
+            unlink(outFile);
+            exit(255);
+        }
 
     }  // while
 
@@ -697,6 +713,8 @@ int main(int argc, char **argv) {
     // dataBlock is declared here, not inside process_data(), so its lifetime covers the
     // whole time worker threads may still dereference it - up through WaitWorkersDone()
     dataBlock_t *dataBlock = NULL;
+    // a file size limit is a write error
+    signal(SIGXFSZ, SIG_IGN);
     process_data(wfile, verbose, workerList, numWorkers, barrier, &dataBlock);
 
     WaitWorkersDone(tid, numWorkers);

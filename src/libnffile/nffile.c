@@ -134,6 +134,8 @@ static void *nfreader(void *arg);
 
 static int nfwrite(nffile_t *nffile, dataBlock_t *block_header);
 
+static int WriteBuffer(int fd, const void *buff, size_t len);
+
 static int ReadAppendix(nffile_t *nffile);
 
 static int WriteAppendix(nffile_t *nffile);
@@ -692,7 +694,10 @@ static int WriteAppendix(nffile_t *nffile) {
     block_header->size += recordHeader->size;
     buff_ptr += recordHeader->size;
 
-    nfwrite(nffile, block_header);
+    if (!nfwrite(nffile, block_header)) {
+        FreeDataBlock(block_header);
+        return 0;
+    }
     FreeDataBlock(block_header);
 
     // NumBlocks are plain data blocks - subtract appendix blocks
@@ -920,7 +925,7 @@ nffile_t *OpenNewFile(const char *filename, unsigned creator, unsigned compress,
 
     nffile->compression_level = COMPRESSION_LEVEL(compress);
 
-    if (write(nffile->fd, (void *)nffile->file_header, sizeof(fileHeaderV2_t)) < (ssize_t)sizeof(fileHeaderV2_t)) {
+    if (!WriteBuffer(nffile->fd, (void *)nffile->file_header, sizeof(fileHeaderV2_t))) {
         LogError("write() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
         close(nffile->fd);
         nffile->fd = 0;
@@ -1050,10 +1055,16 @@ int FlushFile(nffile_t *nffile) {
     // writers terminate, on queue closed and empty
     joinWorkers(nffile);
 
-    fsync(nffile->fd);
+    // a failed writer aborts the queue - the file is incomplete
+    if (nffile->writeError) {
+        queue_clear(nffile->processQueue, (void (*)(void *))FreeDataBlock);
+        LogError("Failed to write file %s", nffile->fileName);
+        return 0;
+    }
 
     if (!WriteAppendix(nffile)) {
         LogError("Failed to write appendix");
+        return 0;
     }
 
     if (lseek(nffile->fd, 0, SEEK_SET) < 0) {
@@ -1063,10 +1074,16 @@ int FlushFile(nffile_t *nffile) {
         return 0;
     }
 
-    if (write(nffile->fd, (void *)nffile->file_header, sizeof(fileHeaderV2_t)) <= 0) {
+    if (!WriteBuffer(nffile->fd, (void *)nffile->file_header, sizeof(fileHeaderV2_t))) {
         LogError("write() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
         close(nffile->fd);
         nffile->fd = 0;
+        return 0;
+    }
+
+    // a delayed write error shows up here
+    if (fsync(nffile->fd) < 0 && errno != EINVAL) {
+        LogError("fsync() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
         return 0;
     }
 
@@ -1301,7 +1318,8 @@ dataBlock_t *WriteBlock(nffile_t *nffile, dataBlock_t *dataBlock) {
     } else if (dataBlock->size != 0) {
         // empty blocks need not to be written
         dbg_printf("WriteBlock - push block with size: %u\n", dataBlock->size);
-        queue_push(nffile->processQueue, dataBlock);
+        // the queue is closed, if a writer failed
+        if (queue_push(nffile->processQueue, dataBlock) == QUEUE_CLOSED) FreeDataBlock(dataBlock);
         dataBlock = NewDataBlock();
     } else {
         // re-init empty block
@@ -1311,15 +1329,38 @@ dataBlock_t *WriteBlock(nffile_t *nffile, dataBlock_t *dataBlock) {
 
 }  // End of WriteBlock
 
-void FlushBlock(nffile_t *nffile, dataBlock_t *dataBlock) {
+// returns 0, if the block can not be written, as a writer failed
+int FlushBlock(nffile_t *nffile, dataBlock_t *dataBlock) {
     if (dataBlock != NULL) {
         if (dataBlock->size != 0 && dataBlock->NumRecords != 0) {
-            queue_push(nffile->processQueue, dataBlock);
+            if (queue_push(nffile->processQueue, dataBlock) == QUEUE_CLOSED) {
+                FreeDataBlock(dataBlock);
+                return 0;
+            }
         } else {
             FreeDataBlock(dataBlock);
         }
     }
+    return nffile->writeError == 0;
 }  // End of FlushBlock
+
+// write all bytes. write() may write less than requested
+static int WriteBuffer(int fd, const void *buff, size_t len) {
+    while (len > 0) {
+        ssize_t ret = write(fd, buff, len);
+        if (ret < 0) {
+            if (errno == EINTR) continue;
+            return 0;
+        }
+        if (ret == 0) {
+            errno = EIO;
+            return 0;
+        }
+        buff = (const char *)buff + ret;
+        len -= (size_t)ret;
+    }
+    return 1;
+}  // End of WriteBuffer
 
 static int nfwrite(nffile_t *nffile, dataBlock_t *block_header) {
     if (block_header->size == 0) {
@@ -1374,11 +1415,12 @@ static int nfwrite(nffile_t *nffile, dataBlock_t *block_header) {
                wptr->NumRecords, wptr->flags);
 
     pthread_mutex_lock(&nffile->wlock);
-    ssize_t ret = write(nffile->fd, (void *)wptr, sizeof(dataBlock_t) + wptr->size);
+    int ok = WriteBuffer(nffile->fd, (void *)wptr, sizeof(dataBlock_t) + wptr->size);
+    int err = errno;
     FreeDataBlock(buff);
-    if (ret < 0) {
+    if (!ok) {
         pthread_mutex_unlock(&nffile->wlock);
-        LogError("write() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
+        LogError("write() error in %s line %d: %s", __FILE__, __LINE__, strerror(err));
         return 0;
     }
 
@@ -1410,7 +1452,12 @@ static void *nfwriter(void *arg) {
         }
         FreeDataBlock(block_header);
 
-        if (!ok) break;
+        if (!ok) {
+            // the file is incomplete. Wake up and stop all producers and writers
+            nffile->writeError = 1;
+            queue_abort(nffile->processQueue);
+            break;
+        }
     }
 
     dbg_printf("nfwriter %p exit\n", (void *)pthread_self());

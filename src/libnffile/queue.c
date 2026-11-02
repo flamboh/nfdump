@@ -135,7 +135,7 @@ queueStat_t queue_stat(queue_t *queue) {
 void queue_sync(queue_t *q) {
     pthread_mutex_lock(&q->mutex);
 
-    while (q->num_elements > 0) pthread_cond_wait(&q->cond_not_full, &q->mutex);
+    while (q->num_elements > 0 && !q->aborted) pthread_cond_wait(&q->cond_not_full, &q->mutex);
 
     pthread_mutex_unlock(&q->mutex);
 
