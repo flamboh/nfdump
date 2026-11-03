@@ -140,8 +140,33 @@ typedef struct legacyBlock_s {
 
 static legacyBlock_t legacyBlock = {0};
 
+#define LEGACY_HEADER_SIZE (sizeof(fileHeaderV1_t) + sizeof(stat_recordV1_t))
+
 // extension size of the nfdump 1.6 extension maps seen so far in the current file, -1 if unknown
 static int32_t legacyMapSize[MAX_EXTENSION_MAPS];
+
+#define LEGACY_EXT_MAX EX_PORT_BLOCK_ALLOC
+
+typedef struct legacyMap_s {
+    uint16_t numExt;
+    uint16_t extSize;
+    uint16_t ext[LEGACY_EXT_MAX + 1];
+} legacyMap_t;
+
+static legacyMap_t *legacyMap[MAX_EXTENSION_MAPS];
+
+static const uint16_t legacyExtSize[LEGACY_EXT_MAX + 1] = {
+    [EX_IO_SNMP_2] = 4,     [EX_IO_SNMP_4] = 8,         [EX_AS_2] = 4,          [EX_AS_4] = 8,
+    [EX_MULIPLE] = 4,       [EX_NEXT_HOP_v4] = 4,       [EX_NEXT_HOP_v6] = 16,  [EX_NEXT_HOP_BGP_v4] = 4,
+    [EX_NEXT_HOP_BGP_v6] = 16, [EX_VLAN] = 4,           [EX_OUT_PKG_4] = 4,     [EX_OUT_PKG_8] = 8,
+    [EX_OUT_BYTES_4] = 4,   [EX_OUT_BYTES_8] = 8,       [EX_AGGR_FLOWS_4] = 4,  [EX_AGGR_FLOWS_8] = 8,
+    [EX_MAC_1] = 16,        [EX_MAC_2] = 16,            [EX_MPLS] = 40,         [EX_ROUTER_IP_v4] = 4,
+    [EX_ROUTER_IP_v6] = 16, [EX_ROUTER_ID] = 4,         [EX_BGPADJ] = 8,        [EX_RECEIVED] = 8,
+    [EX_NSEL_COMMON] = 20,  [EX_NSEL_XLATE_PORTS] = 4,  [EX_NSEL_XLATE_IP_v4] = 8, [EX_NSEL_XLATE_IP_v6] = 32,
+    [EX_NSEL_ACL] = 24,     [EX_NSEL_USER] = 24,        [EX_NSEL_USER_MAX] = 72, [EX_LATENCY] = 24,
+    [EX_NEL_COMMON] = 12,   [EX_PORT_BLOCK_ALLOC] = 8};
+
+static anonCache_t legacyCache;
 
 /* Function Prototypes */
 static void usage(char *name);
@@ -701,7 +726,11 @@ static uint32_t LegacyRecordSize(record_header_t *record, const char *fileName) 
 
 // each file defines its own extension maps
 static void ResetLegacyMaps(void) {
-    for (int i = 0; i < MAX_EXTENSION_MAPS; i++) legacyMapSize[i] = -1;
+    for (int i = 0; i < MAX_EXTENSION_MAPS; i++) {
+        legacyMapSize[i] = -1;
+        free(legacyMap[i]);
+        legacyMap[i] = NULL;
+    }
     ResetCompat16();
 }  // End of ResetLegacyMaps
 
@@ -764,6 +793,181 @@ static dataBlock_t *ConvertLegacyBlock(legacyBlock_t *legacy, const char *fileNa
     return v3Block;
 }  // End of ConvertLegacyBlock
 
+static int AddLegacyMap(extension_map_t *map) {
+    if (map->size < sizeof(extension_map_t) || (map->size & 0x3) || map->map_id >= MAX_EXTENSION_MAPS) return 0;
+    legacyMap_t entry = {0};
+    uint32_t slots = (map->size - offsetof(extension_map_t, ex_id)) / sizeof(uint16_t);
+    uint32_t i = 0;
+    uint32_t extSize = 0;
+    for (; i < slots && map->ex_id[i]; i++) {
+        uint16_t id = map->ex_id[i];
+        if (id > LEGACY_EXT_MAX || legacyExtSize[id] == 0 || entry.numExt > LEGACY_EXT_MAX) return 0;
+        for (int j = 0; j < entry.numExt; j++)
+            if (entry.ext[j] == id) return 0;
+        entry.ext[entry.numExt++] = id;
+        extSize += legacyExtSize[id];
+    }
+    if (i == slots || extSize != map->extension_size) return 0;
+    for (; i < slots; i++) map->ex_id[i] = 0;
+
+    if (!legacyMap[map->map_id]) {
+        legacyMap[map->map_id] = malloc(sizeof(legacyMap_t));
+        if (!legacyMap[map->map_id]) {
+            LogError("malloc() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
+            exit(255);
+        }
+    }
+    entry.extSize = extSize;
+    *legacyMap[map->map_id] = entry;
+    return 1;
+}  // End of AddLegacyMap
+
+static int AnonLegacyRecord(anonCache_t *cache, common_record_t *record, int anon_src, int anon_dst, int mark_tos) {
+    if (record->size < offsetof(common_record_t, data) || record->ext_map >= MAX_EXTENSION_MAPS || !legacyMap[record->ext_map]) return 0;
+    legacyMap_t *map = legacyMap[record->ext_map];
+
+    uint32_t size = offsetof(common_record_t, data);
+    size += TestFlag(record->flags, FLAG_IPV6_ADDR) ? 4 * sizeof(uint64_t) : 2 * sizeof(uint32_t);
+    size += TestFlag(record->flags, FLAG_PKG_64) ? sizeof(uint64_t) : sizeof(uint32_t);
+    size += TestFlag(record->flags, FLAG_BYTES_64) ? sizeof(uint64_t) : sizeof(uint32_t);
+    size += map->extSize;
+    if (record->size != size) return 0;
+
+    uint8_t *p = (uint8_t *)record->data;
+    int srcAnon = 0, dstAnon = 0;
+    if (TestFlag(record->flags, FLAG_IPV6_ADDR)) {
+        uint64_t *addr = (uint64_t *)p;
+        if (anon_src) srcAnon = AnonIPv6(cache, addr);
+        if (anon_dst) dstAnon = AnonIPv6(cache, addr + 2);
+        p += 4 * sizeof(uint64_t);
+    } else {
+        uint32_t *addr = (uint32_t *)p;
+        if (anon_src) srcAnon = AnonIPv4(cache, addr);
+        if (anon_dst) dstAnon = AnonIPv4(cache, addr + 1);
+        p += 2 * sizeof(uint32_t);
+    }
+    p += TestFlag(record->flags, FLAG_PKG_64) ? sizeof(uint64_t) : sizeof(uint32_t);
+    p += TestFlag(record->flags, FLAG_BYTES_64) ? sizeof(uint64_t) : sizeof(uint32_t);
+
+    uint16_t *as16 = NULL;
+    uint32_t *as32 = NULL;
+    tpl_ext_26_t *asAdjacent = NULL;
+    for (int i = 0; i < map->numExt; i++) {
+        switch (map->ext[i]) {
+            case EX_AS_2:
+                as16 = (uint16_t *)p;
+                break;
+            case EX_AS_4:
+                as32 = (uint32_t *)p;
+                break;
+            case EX_BGPADJ:
+                asAdjacent = (tpl_ext_26_t *)p;
+                break;
+            case EX_NEXT_HOP_v4:
+            case EX_NEXT_HOP_BGP_v4:
+            case EX_ROUTER_IP_v4:
+                AnonIPv4(cache, (uint32_t *)p);
+                break;
+            case EX_NEXT_HOP_v6:
+            case EX_NEXT_HOP_BGP_v6:
+            case EX_ROUTER_IP_v6:
+                AnonIPv6(cache, (uint64_t *)p);
+                break;
+            case EX_NSEL_XLATE_IP_v4:
+                if (anon_src) AnonIPv4(cache, (uint32_t *)p);
+                if (anon_dst) AnonIPv4(cache, (uint32_t *)p + 1);
+                break;
+            case EX_NSEL_XLATE_IP_v6:
+                if (anon_src) AnonIPv6(cache, (uint64_t *)p);
+                if (anon_dst) AnonIPv6(cache, (uint64_t *)p + 2);
+                break;
+        }
+        p += legacyExtSize[map->ext[i]];
+    }
+
+    int zeroSrc = netList ? srcAnon : anon_src;
+    int zeroDst = netList ? dstAnon : anon_dst;
+    if (as16) {
+        if (zeroSrc) as16[0] = 0;
+        if (zeroDst) as16[1] = 0;
+    }
+    if (as32) {
+        if (zeroSrc) as32[0] = 0;
+        if (zeroDst) as32[1] = 0;
+    }
+    if (asAdjacent) {
+        if (netList ? srcAnon : 1) asAdjacent->bgpPrevAdjacentAS = 0;
+        if (netList ? dstAnon : 1) asAdjacent->bgpNextAdjacentAS = 0;
+    }
+    if (mark_tos) record->tos = (record->tos & 0xfc) | (zeroSrc ? 2 : 0) | (zeroDst ? 1 : 0);
+    return 1;
+}  // End of AnonLegacyRecord
+
+static int AnonLegacyExporter(anonCache_t *cache, exporter_info_record_t *exporter) {
+    if (exporter->header.size != sizeof(exporter_info_record_t)) return 0;
+    uint64_t u[2];
+    memcpy(u, exporter->ip, sizeof(u));
+    switch (exporter->fill) {
+        case AF_INET: {
+            uint32_t ipv4 = (uint32_t)u[1];
+            AnonIPv4(cache, &ipv4);
+            u[1] = (u[1] & 0xFFFFFFFF00000000ULL) | ipv4;
+        } break;
+        case AF_INET6:
+            AnonIPv6(cache, u);
+            break;
+        default:
+            return 0;
+    }
+    memcpy(exporter->ip, u, sizeof(u));
+    return 1;
+}  // End of AnonLegacyExporter
+
+static void AnonLegacyBlock(dataBlock_t *dataBlock, const char *fileName, int anon_src, int anon_dst, int mark_tos) {
+    if (!legacyCache.v4) {
+        legacyCache.v4 = calloc(1 << ANONCACHE4_BITS, sizeof(anonCache4_t));
+        legacyCache.v6 = calloc(1 << ANONCACHE6_BITS, sizeof(anonCache6_t));
+        if (!legacyCache.v4 || !legacyCache.v6) {
+            LogError("calloc() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
+            exit(255);
+        }
+    }
+    uint32_t offset = 0;
+    for (uint32_t i = 0; i < dataBlock->NumRecords; i++) {
+        record_header_t *record = (record_header_t *)(GetCursor(dataBlock) + offset);
+        if (offset + sizeof(record_header_t) > dataBlock->size || record->size < sizeof(record_header_t) ||
+            offset + record->size > dataBlock->size) {
+            LogError("Corrupt data file. Inconsistent block size in '%s'", fileName);
+            exit(255);
+        }
+        int ok = 0;
+        switch (record->type) {
+            case ExtensionMapType:
+                ok = AddLegacyMap((extension_map_t *)record);
+                break;
+            case CommonRecordType:
+                ok = AnonLegacyRecord(&legacyCache, (common_record_t *)record, anon_src, anon_dst, mark_tos);
+                break;
+            case ExporterInfoRecordType:
+                ok = AnonLegacyExporter(&legacyCache, (exporter_info_record_t *)record);
+                break;
+            case ExporterStatRecordType:
+            case SamplerLegacyRecordType:
+                ok = ValidRecordSize(record);
+                break;
+        }
+        if (!ok) {
+            LogError("Can not anonymize nfdump 1.6 record type %u with size %u in '%s'", record->type, record->size, fileName);
+            exit(255);
+        }
+        offset += record->size;
+    }
+    if (offset != dataBlock->size) {
+        LogError("Corrupt data file. %u bytes after the last record in '%s'", dataBlock->size - offset, fileName);
+        exit(255);
+    }
+}  // End of AnonLegacyBlock
+
 static void CheckDataEnd(nffile_t *nffile) {
     struct stat st;
     off_t pos = lseek(nffile->fd, 0, SEEK_CUR);
@@ -798,7 +1002,22 @@ static void CheckDataEnd(nffile_t *nffile) {
 }  // End of CheckDataEnd
 
 // read the next data block and convert nfdump 1.6 blocks. Fail on a truncated or corrupt input file
-static dataBlock_t *NextBlock(nffile_t *nffile, uint32_t *blockCount) {
+static int ReadHeaderV1(nffile_t *nffile, uint8_t *header) {
+    fileHeaderV1_t *fileHeader = (fileHeaderV1_t *)header;
+    ssize_t len = pread(nffile->fd, header, LEGACY_HEADER_SIZE, 0);
+    if (len < (ssize_t)sizeof(uint32_t)) {
+        LogError("Failed to read the header of '%s'", nffile->fileName);
+        exit(255);
+    }
+    if (fileHeader->version != LAYOUT_VERSION_1) return 0;
+    if (len != LEGACY_HEADER_SIZE || fileHeader->magic != MAGIC) {
+        LogError("Corrupt nfdump 1.6 header in '%s'", nffile->fileName);
+        exit(255);
+    }
+    return 1;
+}  // End of ReadHeaderV1
+
+static dataBlock_t *NextBlock(nffile_t *nffile, uint32_t *blockCount, int convert) {
     while (1) {
         if (legacyBlock.dataBlock) {
             dataBlock_t *v3Block = ConvertLegacyBlock(&legacyBlock, nffile->fileName);
@@ -822,14 +1041,14 @@ static dataBlock_t *NextBlock(nffile_t *nffile, uint32_t *blockCount) {
             return NULL;
         }
         (*blockCount)++;
-        if (dataBlock->type != DATA_BLOCK_TYPE_2) return dataBlock;
+        if (dataBlock->type != DATA_BLOCK_TYPE_2 || !convert) return dataBlock;
 
         // nfdump 1.6.x records - the workers anonymize V3 records only
         legacyBlock = (legacyBlock_t){.dataBlock = dataBlock, .offset = 0, .nextRecord = 0};
     }
 }  // End of NextBlock
 
-static nffile_t *OpenOutputFile(char *outFile, const char *finalName, unsigned compression) {
+static nffile_t *OpenOutputFile(char *outFile, const char *finalName, unsigned compression, const uint8_t *headerV1) {
     int len = snprintf(outFile, MAXPATHLEN, "%s-XXXXXX", finalName);
     if (len < 0 || len >= MAXPATHLEN) {
         LogError("Output file name too long");
@@ -848,15 +1067,24 @@ static nffile_t *OpenOutputFile(char *outFile, const char *finalName, unsigned c
         LogError("Failed to create output file '%s': %s", outFile, strerror(errno));
         exit(255);
     }
-    nffile_t *nffile = OpenNewFileFd(fd, outFile, CREATOR_NFANON, compression, NOT_ENCRYPTED);
+    nffile_t *nffile = headerV1 ? OpenNewFileV1Fd(fd, outFile, compression, headerV1, LEGACY_HEADER_SIZE)
+                                : OpenNewFileFd(fd, outFile, CREATOR_NFANON, compression, NOT_ENCRYPTED);
     if (!nffile) exit(255);
     BlockSignals(0);
 
     return nffile;
 }  // End of OpenOutputFile
 
-static void CloseOutputFile(nffile_t *nffile, const char *outFile, const char *finalName) {
-    if (!FlushFile(nffile) || !CloseFile(nffile)) {
+static void CloseOutputFile(nffile_t *nffile, const char *outFile, const char *finalName, int64_t expectedBlocks) {
+    if (!FlushFile(nffile)) {
+        LogError("Failed to write output file '%s'", outFile);
+        exit(255);
+    }
+    if (expectedBlocks >= 0 && nffile->file_header->NumBlocks != expectedBlocks) {
+        LogError("Wrote %u of %lld blocks to '%s'", nffile->file_header->NumBlocks, (long long)expectedBlocks, outFile);
+        exit(255);
+    }
+    if (!CloseFile(nffile)) {
         LogError("Failed to write output file '%s'", outFile);
         exit(255);
     }
@@ -877,6 +1105,12 @@ static void process_data(queue_t *fileList, char *wfile, int verbose, worker_par
     const char spinner[4] = {'|', '/', '-', '\\'};
     char outFile[MAXPATHLEN];
     char *cfile = NULL;
+    uint8_t headerV1[LEGACY_HEADER_SIZE];
+    int layoutV1 = 0;
+    int64_t expectedBlocks = -1;
+    int anon_src = workerList[0]->anon_src;
+    int anon_dst = workerList[0]->anon_dst;
+    int mark_tos = workerList[0]->mark_tos;
 
     int cnt = 1;
     uint32_t blockCount = 0;
@@ -906,7 +1140,7 @@ static void process_data(queue_t *fileList, char *wfile, int verbose, worker_par
             /* Without -w, finish and replace each input file separately.
              * With -w, keep the writer open and append every input file. */
             if (nffile_w && wfile == NULL) {
-                CloseOutputFile(nffile_w, outFile, cfile);
+                CloseOutputFile(nffile_w, outFile, cfile, expectedBlocks);
                 nffile_w = NULL;
             }
 
@@ -914,7 +1148,7 @@ static void process_data(queue_t *fileList, char *wfile, int verbose, worker_par
             nffile_r = OpenNextFile(fileList);
             if (nffile_r == NULL) {
                 if (nffile_w) {
-                    CloseOutputFile(nffile_w, outFile, wfile);
+                    CloseOutputFile(nffile_w, outFile, wfile, expectedBlocks);
                     nffile_w = NULL;
                 }
                 done = 1;
@@ -930,8 +1164,16 @@ static void process_data(queue_t *fileList, char *wfile, int verbose, worker_par
             if (verbose) printf("  %i Processing %s\r", cnt++, cfile);
             ResetLegacyMaps();
 
+            int fileV1 = ReadHeaderV1(nffile_r, headerV1);
+            if (nffile_w && wfile && (layoutV1 || fileV1)) {
+                LogError("Can not write '%s' and another file into one file: nfdump 1.6 files are anonymized one per output file", cfile);
+                exit(255);
+            }
+            layoutV1 = fileV1;
+            expectedBlocks = layoutV1 ? (int64_t)((fileHeaderV1_t *)headerV1)->NumBlocks : -1;
+
             if (wfile == NULL || nffile_w == NULL) {
-                nffile_w = OpenOutputFile(outFile, wfile ? wfile : cfile, FILE_COMPRESSION(nffile_r));
+                nffile_w = OpenOutputFile(outFile, wfile ? wfile : cfile, FILE_COMPRESSION(nffile_r), layoutV1 ? headerV1 : NULL);
                 SetIdent(nffile_w, FILE_IDENT(nffile_r));
                 memcpy(nffile_w->stat_record, nffile_r->stat_record, sizeof(stat_record_t));
             } else {
@@ -941,7 +1183,7 @@ static void process_data(queue_t *fileList, char *wfile, int verbose, worker_par
 
             // read first block from next file
             blockCount = 0;
-            nextBlock = NextBlock(nffile_r, &blockCount);
+            nextBlock = NextBlock(nffile_r, &blockCount, !layoutV1);
             continue;
         }
 
@@ -950,24 +1192,26 @@ static void process_data(queue_t *fileList, char *wfile, int verbose, worker_par
             blk_count++;
         }
 
-        if ((*dataBlockPtr)->type != DATA_BLOCK_TYPE_3) {
+        if ((*dataBlockPtr)->type != (layoutV1 ? DATA_BLOCK_TYPE_2 : DATA_BLOCK_TYPE_3)) {
             LogError("Can not anonymize block type %u in '%s'", (*dataBlockPtr)->type, cfile);
             exit(255);
         }
 
-        dbg_printf("Next block: %d, Records: %u\n", blk_count, (*dataBlockPtr)->NumRecords);
-        // release workers from barrier
-        pthread_control_barrier_release(barrier);
+        if (layoutV1) {
+            AnonLegacyBlock(*dataBlockPtr, cfile, anon_src, anon_dst, mark_tos);
+            nextBlock = NextBlock(nffile_r, &blockCount, 0);
+        } else {
+            dbg_printf("Next block: %d, Records: %u\n", blk_count, (*dataBlockPtr)->NumRecords);
+            pthread_control_barrier_release(barrier);
 
-        // prefetch next block
-        nextBlock = NextBlock(nffile_r, &blockCount);
+            nextBlock = NextBlock(nffile_r, &blockCount, 1);
 
-        // wait for all workers, work done on previous block
-        pthread_controller_wait(barrier);
+            pthread_controller_wait(barrier);
 
-        if (atomic_load(&anonError)) {
-            LogError("Failed to anonymize '%s'", cfile);
-            exit(255);
+            if (atomic_load(&anonError)) {
+                LogError("Failed to anonymize '%s'", cfile);
+                exit(255);
+            }
         }
 
         // write modified block
