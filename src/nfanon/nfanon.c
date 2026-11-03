@@ -699,6 +699,39 @@ static dataBlock_t *ConvertLegacyBlock(legacyBlock_t *legacy, const char *fileNa
     return v3Block;
 }  // End of ConvertLegacyBlock
 
+static void CheckDataEnd(nffile_t *nffile) {
+    struct stat st;
+    off_t pos = lseek(nffile->fd, 0, SEEK_CUR);
+    if (pos < 0 || fstat(nffile->fd, &st) < 0) {
+        LogError("Failed to check input file '%s': %s", nffile->fileName, strerror(errno));
+        exit(255);
+    }
+
+    off_t end = pos;
+    if (nffile->file_header->appendixBlocks) {
+        if (pos != (off_t)nffile->file_header->offAppendix) {
+            LogError("Corrupt input file '%s': %u data blocks end at offset %lld, the appendix starts at %lld", nffile->fileName,
+                     nffile->file_header->NumBlocks, (long long)pos, (long long)nffile->file_header->offAppendix);
+            exit(255);
+        }
+        for (unsigned i = 0; i < nffile->file_header->appendixBlocks; i++) {
+            dataBlock_t header;
+            if (pread(nffile->fd, &header, sizeof(header), end) != (ssize_t)sizeof(header)) {
+                LogError("Corrupt input file '%s': truncated appendix", nffile->fileName);
+                exit(255);
+            }
+            end += sizeof(header) + header.size;
+        }
+    }
+
+    if (end != st.st_size) {
+        LogError("Corrupt input file '%s': %u data blocks and %u appendix blocks end at offset %lld, the file size is %lld",
+                 nffile->fileName, nffile->file_header->NumBlocks, nffile->file_header->appendixBlocks, (long long)end,
+                 (long long)st.st_size);
+        exit(255);
+    }
+}  // End of CheckDataEnd
+
 // read the next data block and convert nfdump 1.6 blocks. Fail on a truncated or corrupt input file
 static dataBlock_t *NextBlock(nffile_t *nffile, uint32_t *blockCount) {
     while (1) {
@@ -720,6 +753,7 @@ static dataBlock_t *NextBlock(nffile_t *nffile, uint32_t *blockCount) {
                          nffile->file_header->NumBlocks);
                 exit(255);
             }
+            CheckDataEnd(nffile);
             return NULL;
         }
         (*blockCount)++;
