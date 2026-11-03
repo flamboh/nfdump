@@ -244,6 +244,8 @@ nffile_t *OpenFile(const char *filename);
 
 nffile_t *OpenNewFile(const char *filename, unsigned creator, unsigned compress, unsigned encryption);
 
+nffile_t *OpenNewFileFd(int fd, const char *filename, unsigned creator, unsigned compress, unsigned encryption);
+
 nffile_t *AppendFile(const char *filename);
 
 int ChangeIdent(char *filename, char *Ident);

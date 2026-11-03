@@ -120,6 +120,8 @@ static atomic_int anonError = 0;
 // output file being written. Removed, if nfanon exits before it is complete
 static char pendingFile[MAXPATHLEN] = {0};
 
+static mode_t outputMode = S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH;
+
 // signals, which remove the pending file. Only the main thread handles them
 static sigset_t termSignals;
 
@@ -827,7 +829,32 @@ static dataBlock_t *NextBlock(nffile_t *nffile, uint32_t *blockCount) {
     }
 }  // End of NextBlock
 
-// finish the output file and rename it to finalName, if given
+static nffile_t *OpenOutputFile(char *outFile, const char *finalName, unsigned compression) {
+    int len = snprintf(outFile, MAXPATHLEN, "%s-XXXXXX", finalName);
+    if (len < 0 || len >= MAXPATHLEN) {
+        LogError("Output file name too long");
+        exit(255);
+    }
+
+    BlockSignals(1);
+    int fd = mkstemp(outFile);
+    if (fd < 0) {
+        LogError("mkstemp() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
+        exit(255);
+    }
+    snprintf(pendingFile, sizeof(pendingFile), "%s", outFile);
+
+    if (fchmod(fd, outputMode) < 0) {
+        LogError("Failed to create output file '%s': %s", outFile, strerror(errno));
+        exit(255);
+    }
+    nffile_t *nffile = OpenNewFileFd(fd, outFile, CREATOR_NFANON, compression, NOT_ENCRYPTED);
+    if (!nffile) exit(255);
+    BlockSignals(0);
+
+    return nffile;
+}  // End of OpenOutputFile
+
 static void CloseOutputFile(nffile_t *nffile, const char *outFile, const char *finalName) {
     if (!FlushFile(nffile) || !CloseFile(nffile)) {
         LogError("Failed to write output file '%s'", outFile);
@@ -836,7 +863,7 @@ static void CloseOutputFile(nffile_t *nffile, const char *outFile, const char *f
     DisposeFile(nffile);
 
     BlockSignals(1);
-    if (finalName && rename(outFile, finalName) < 0) {
+    if (rename(outFile, finalName) < 0) {
         LogError("rename() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
         exit(255);
     }
@@ -850,8 +877,6 @@ static void process_data(queue_t *fileList, char *wfile, int verbose, worker_par
     const char spinner[4] = {'|', '/', '-', '\\'};
     char outFile[MAXPATHLEN];
     char *cfile = NULL;
-    // -w names an existing file. Write a new file and replace it, when complete
-    int replaceOutput = 0;
 
     int cnt = 1;
     uint32_t blockCount = 0;
@@ -889,7 +914,7 @@ static void process_data(queue_t *fileList, char *wfile, int verbose, worker_par
             nffile_r = OpenNextFile(fileList);
             if (nffile_r == NULL) {
                 if (nffile_w) {
-                    CloseOutputFile(nffile_w, outFile, replaceOutput ? wfile : NULL);
+                    CloseOutputFile(nffile_w, outFile, wfile);
                     nffile_w = NULL;
                 }
                 done = 1;
@@ -906,31 +931,7 @@ static void process_data(queue_t *fileList, char *wfile, int verbose, worker_par
             ResetLegacyMaps();
 
             if (wfile == NULL || nffile_w == NULL) {
-                int len;
-                if (wfile == NULL) {
-                    // prepare output file
-                    len = snprintf(outFile, sizeof(outFile), "%s-tmp", cfile);
-                } else {
-                    // never write into an existing file, which may be an input file
-                    struct stat st;
-                    replaceOutput = stat(wfile, &st) == 0 && S_ISREG(st.st_mode);
-                    len = snprintf(outFile, sizeof(outFile), replaceOutput ? "%s-tmp" : "%s", wfile);
-                }
-                if (len < 0 || len >= (int)sizeof(outFile)) {
-                    LogError("Output file name too long");
-                    exit(255);
-                }
-                CheckInputAlias(nffile_r, outFile);
-
-                BlockSignals(1);
-                nffile_w = OpenNewFile(outFile, CREATOR_NFANON, FILE_COMPRESSION(nffile_r), NOT_ENCRYPTED);
-                if (!nffile_w) {
-                    // can not create output file
-                    exit(255);
-                }
-                snprintf(pendingFile, sizeof(pendingFile), "%s", outFile);
-                BlockSignals(0);
-
+                nffile_w = OpenOutputFile(outFile, wfile ? wfile : cfile, FILE_COMPRESSION(nffile_r));
                 SetIdent(nffile_w, FILE_IDENT(nffile_r));
                 memcpy(nffile_w->stat_record, nffile_r->stat_record, sizeof(stat_record_t));
             } else {
@@ -1273,6 +1274,10 @@ int main(int argc, char **argv) {
     // SIGABRT for a failed assertion in the nfdump 1.6 conversion code
     sigaddset(&termSignals, SIGABRT);
     BlockSignals(1);
+
+    mode_t mask = umask(0);
+    umask(mask);
+    outputMode &= ~mask;
 
     queue_t *fileList = SetupInputFileSequence(&flist);
     if (!fileList || !Init_nffile(numWorkers, fileList)) exit(255);

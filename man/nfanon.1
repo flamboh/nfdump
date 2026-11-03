@@ -77,15 +77,15 @@ containing many flow files.
 .It Fl w Ar nffile
 File name to write anonymized flow records to. If this argument is missing, the source
 file name is taken, which means the original file is overwritten.
-If
-.Ar nffile
-exists,
 .Nm
-writes into
-.Ar nffile Ns -tmp
-and renames it to
+writes into a new temporary file
+.Ar nffile Ns -XXXXXX
+in the same directory, with a unique random suffix, and renames it to
 .Ar nffile
-when complete. An existing file is replaced, never written into, so
+when complete. Without
+.Fl w
+the temporary file is named after the input file. An existing file is
+replaced, never written into, so
 .Ar nffile
 may name the input file, or a hard or symbolic link to it.
 .It Fl K Ar key
@@ -168,14 +168,18 @@ Print help text to stdout and exit.
 .Sh EXIT STATUS
 .Nm
 returns 0 on success, and 1 or 255 otherwise. Any error is fatal: a record or block
-that can not be anonymized, a corrupt, truncated or unreadable input file, or an
-output file that can not be written completely, for example on a full disk.
+that can not be anonymized, a corrupt, truncated or unreadable input file, data
+blocks the file header does not count, bytes after the last block, or an
+output file that can not be written or closed completely, for example on a full disk.
 .Pp
 On a fatal error, and when terminated by SIGTERM, SIGINT, SIGHUP or SIGABRT,
 .Nm
 removes the incomplete output file and never replaces an input file in place.
-Other signals, such as SIGKILL, may leave an incomplete output file or a
-temporary file ending in -tmp behind, but never replace an input file. Use the
+Other signals, such as SIGKILL, may leave a temporary file
+.Ar nffile Ns -XXXXXX
+behind, but never replace an input file or the file named by
+.Fl w .
+Use the
 output file only if
 .Nm
 returned 0.
