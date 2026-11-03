@@ -1170,6 +1170,7 @@ static void process_data(queue_t *fileList, char *wfile, int verbose, worker_par
                 exit(255);
             }
             layoutV1 = fileV1;
+            if (layoutV1) ((fileHeaderV1_t *)headerV1)->flags |= FLAG_ANONYMIZED;
             expectedBlocks = layoutV1 ? (int64_t)((fileHeaderV1_t *)headerV1)->NumBlocks : -1;
 
             if (wfile == NULL || nffile_w == NULL) {
