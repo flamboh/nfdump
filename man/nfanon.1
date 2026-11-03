@@ -88,6 +88,13 @@ the temporary file is named after the input file. An existing file is
 replaced, never written into, so
 .Ar nffile
 may name the input file, or a hard or symbolic link to it.
+.Pp
+A file in the nfdump 1.6 layout is written in the same layout: the records are
+anonymized in place, the blocks keep their order and compression, and the file
+header and statistics record are copied from the input. Each such file needs its
+own output file, so
+.Fl w
+with several input files fails, if one of them has the nfdump 1.6 layout.
 .It Fl K Ar key
 .Ar key
 is either a 32 character string, or a 64 char hex string starting with 0x. This key

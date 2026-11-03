@@ -191,6 +191,8 @@ typedef struct nffile_s {
     queue_t *processQueue;  // blocks ready to be processed. Connects consumer/producer threads
     pthread_mutex_t wlock;  // writer lock
     _Atomic int writeError; // a writer failed - the file is incomplete
+    uint8_t *headerV1;      // layout V1 output: file header and stat record
+    uint32_t headerV1Size;
     pthread_t worker[];     // nfread/nfwrite worker thread;
 } nffile_t;
 
@@ -245,6 +247,8 @@ nffile_t *OpenFile(const char *filename);
 nffile_t *OpenNewFile(const char *filename, unsigned creator, unsigned compress, unsigned encryption);
 
 nffile_t *OpenNewFileFd(int fd, const char *filename, unsigned creator, unsigned compress, unsigned encryption);
+
+nffile_t *OpenNewFileV1Fd(int fd, const char *filename, unsigned compress, const void *header, uint32_t headerSize);
 
 nffile_t *AppendFile(const char *filename);
 
