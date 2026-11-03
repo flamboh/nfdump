@@ -874,6 +874,24 @@ nffile_t *OpenFile(const char *filename) {
 
 }  // End of OpenFile
 
+static int CompressionAvailable(unsigned compress) {
+#ifndef HAVE_ZSTD
+    if ((compress & 0xFFFF) == ZSTD_COMPRESSED) {
+        LogError("OpenNewFile: ZSTD compression not compiled in");
+        return 0;
+    }
+#endif
+
+#ifndef HAVE_BZ2
+    if ((compress & 0xFFFF) == BZ2_COMPRESSED) {
+        LogError("OpenNewFile: BZIP2 compression not compiled in");
+        return 0;
+    }
+#endif
+    (void)compress;
+    return 1;
+}  // End of CompressionAvailable
+
 // Create a new nffile
 //  filename   : full path of file to create
 //  nffile     : Use nffile handle and initialize it accordingly. If NULL a new handle is allocated
@@ -881,25 +899,21 @@ nffile_t *OpenFile(const char *filename) {
 //  compress   : Compression algorithm and level. Lower 16bit: algo. Upper 16bit level
 //  encryption : Encryption algorithm used.
 nffile_t *OpenNewFile(const char *filename, unsigned creator, unsigned compress, unsigned encryption) {
-    int fd;
+    if (!CompressionAvailable(compress)) return NULL;
 
-#ifndef HAVE_ZSTD
-    if ((compress & 0xFFFF) == ZSTD_COMPRESSED) {
-        LogError("OpenNewFile: ZSTD compression not compiled in");
-        return NULL;
-    }
-#endif
-
-#ifndef HAVE_BZ2
-    if ((compress & 0xFFFF) == BZ2_COMPRESSED) {
-        LogError("OpenNewFile: BZIP2 compression not compiled in");
-        return NULL;
-    }
-#endif
-
-    fd = open(filename, O_CREAT | O_RDWR | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    int fd = open(filename, O_CREAT | O_RDWR | O_TRUNC, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
     if (fd < 0) {
         LogError("Failed to open file %s: '%s'", filename, strerror(errno));
+        return NULL;
+    }
+
+    return OpenNewFileFd(fd, filename, creator, compress, encryption);
+} /* End of OpenNewFile */
+
+nffile_t *OpenNewFileFd(int fd, const char *filename, unsigned creator, unsigned compress, unsigned encryption) {
+    if (!CompressionAvailable(compress)) {
+        close(fd);
+        unlink(filename);
         return NULL;
     }
 
@@ -953,7 +967,7 @@ nffile_t *OpenNewFile(const char *filename, unsigned creator, unsigned compress,
     }
     return nffile;
 
-} /* End of OpenNewFile */
+} /* End of OpenNewFileFd */
 
 nffile_t *AppendFile(const char *filename) {
     nffile_t *nffile;
