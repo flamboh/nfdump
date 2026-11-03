@@ -589,6 +589,69 @@ static int ValidRecordSize(record_header_t *record) {
     return 0;
 }  // End of ValidRecordSize
 
+static int ValidOldNbarRecord(arrayRecordHeader_t *array) {
+    const size_t infoSize = 3 * sizeof(uint16_t);
+    const size_t padSize = 2;
+    uint8_t *cursor = (uint8_t *)array + sizeof(arrayRecordHeader_t);
+    size_t available = array->size - sizeof(arrayRecordHeader_t);
+    if (array->numElements == 0) return 0;
+    for (int i = 0; i < array->numElements; i++) {
+        if (available < sizeof(elementHeader_t)) return 0;
+        elementHeader_t *element = (elementHeader_t *)cursor;
+        size_t length = element->length;
+        if (element->type != NbarAppInfoID || length < infoSize + padSize || sizeof(elementHeader_t) + length > available) return 0;
+        uint16_t *lengths = (uint16_t *)(cursor + sizeof(elementHeader_t));
+        uint8_t *data = (uint8_t *)lengths + infoSize;
+        size_t nameEnd = (size_t)lengths[0] + lengths[1];
+        size_t descEnd = nameEnd + lengths[2];
+        if (infoSize + descEnd + padSize != length) return 0;
+        if ((lengths[1] && data[nameEnd - 1] != '\0') || (lengths[2] && data[descEnd - 1] != '\0')) return 0;
+        memset(data + descEnd, 0, padSize);
+        cursor += sizeof(elementHeader_t) + length;
+        available -= sizeof(elementHeader_t) + length;
+    }
+    return available == 0;
+}  // End of ValidOldNbarRecord
+
+static int ValidArrayLayout(arrayRecordHeader_t *array) {
+    if (array->size < sizeof(arrayRecordHeader_t)) return 0;
+    if (array->type == NbarRecordType && array->elementSize == 0) return ValidOldNbarRecord(array);
+
+    uint8_t *info = (uint8_t *)array + sizeof(arrayRecordHeader_t);
+    size_t infoSize = array->type == NbarRecordType ? sizeof(NbarAppInfo_t) : sizeof(uint32_t);
+    size_t available = array->size - sizeof(arrayRecordHeader_t);
+    if (available < infoSize || (size_t)array->numElements * array->elementSize != available - infoSize) return 0;
+    if (array->numElements == 0) return 1;
+
+    size_t used, nameEnd = 0, descEnd = 0;
+    if (array->type == NbarRecordType) {
+        NbarAppInfo_t *nbarInfo = (NbarAppInfo_t *)info;
+        if (nbarInfo->app_name_length) nameEnd = (size_t)nbarInfo->app_id_length + nbarInfo->app_name_length;
+        used = (size_t)nbarInfo->app_id_length + nbarInfo->app_name_length + nbarInfo->app_desc_length;
+        if (nbarInfo->app_desc_length) descEnd = used;
+    } else {
+        uint32_t nameLength = *(uint32_t *)info;
+        used = sizeof(uint32_t) + (size_t)nameLength;
+        if (nameLength) nameEnd = used;
+    }
+    if (used > array->elementSize) return 0;
+
+    uint8_t *element = info + infoSize;
+    for (int i = 0; i < array->numElements; i++) {
+        if ((nameEnd && element[nameEnd - 1] != '\0') || (descEnd && element[descEnd - 1] != '\0')) return 0;
+        memset(element + used, 0, array->elementSize - used);
+        element += array->elementSize;
+    }
+    return 1;
+}  // End of ValidArrayLayout
+
+static int ValidArrayRecord(record_header_t *record) {
+    if (ValidArrayLayout((arrayRecordHeader_t *)record)) return 1;
+
+    LogError("Corrupt record type %u with size %u", record->type, record->size);
+    return 0;
+}  // End of ValidArrayRecord
+
 // open the next input file. Unlike GetNextFile(), fail on a file, which can not be opened
 static nffile_t *OpenNextFile(queue_t *fileList) {
     char *fileName = queue_pop(fileList);
@@ -972,7 +1035,7 @@ static void *worker_thread(void *arg) {
                     case NbarRecordType:
                     case IfNameRecordType:
                     case VrfNameRecordType:
-                        // names without addresses
+                        ok = ValidArrayRecord(record_ptr);
                         break;
                     case SlackRecord:
                         memset((void *)record_ptr + sizeof(record_header_t), 0, record_ptr->size - sizeof(record_header_t));
