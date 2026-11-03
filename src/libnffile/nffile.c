@@ -910,6 +910,8 @@ nffile_t *OpenNewFile(const char *filename, unsigned creator, unsigned compress,
     // Allocate/Init nffile struct
     nffile_t *nffile = NewFile(NumThreads);
     if (nffile == NULL) {
+        close(fd);
+        unlink(filename);
         return NULL;
     }
     nffile->fd = fd;
@@ -944,6 +946,7 @@ nffile_t *OpenNewFile(const char *filename, unsigned creator, unsigned compress,
             nffile->worker[i] = 0;
             LogError("pthread_create() error in %s line %d: %s", __FILE__, __LINE__, strerror(err));
             DisposeFile(nffile);
+            unlink(filename);
             return NULL;
         }
         nffile->worker[i] = tid;
@@ -1099,15 +1102,19 @@ int FlushFile(nffile_t *nffile) {
 } /* End of FlushFile */
 
 // close reading file
-void CloseFile(nffile_t *nffile) {
-    if (!nffile) return;
+int CloseFile(nffile_t *nffile) {
+    if (!nffile) return 1;
 
+    int ok = 1;
     if (nffile->fd) {
         dbg_printf("Terminate nffile: %s\n", nffile->fileName);
         // make sure all workers are gone
         TerminateWorkers(nffile);
 
-        close(nffile->fd);
+        if (close(nffile->fd) < 0) {
+            LogError("close() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
+            ok = 0;
+        }
         nffile->fd = 0;
     }
 
@@ -1115,6 +1122,7 @@ void CloseFile(nffile_t *nffile) {
     queue_clear(nffile->processQueue, (void (*)(void *))FreeDataBlock);
 
     nffile->file_header->NumBlocks = 0;
+    return ok;
 }  // End of CloseFile
 
 // destroy nffile handle: free up all resources
