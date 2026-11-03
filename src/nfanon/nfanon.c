@@ -903,6 +903,8 @@ static int AnonLegacyRecord(anonCache_t *cache, common_record_t *record, int ano
     return 1;
 }  // End of AnonLegacyRecord
 
+static int LegacyIPv6Family(uint16_t family) { return family == 10 || family == 24 || family == 28 || family == 30; }
+
 static int AnonLegacyExporter(anonCache_t *cache, exporter_info_record_t *exporter) {
     if (exporter->header.size != sizeof(exporter_info_record_t)) return 0;
     uint64_t u[2];
@@ -913,11 +915,9 @@ static int AnonLegacyExporter(anonCache_t *cache, exporter_info_record_t *export
             AnonIPv4(cache, &ipv4);
             u[1] = (u[1] & 0xFFFFFFFF00000000ULL) | ipv4;
         } break;
-        case AF_INET6:
-            AnonIPv6(cache, u);
-            break;
         default:
-            return 0;
+            if (!LegacyIPv6Family(exporter->fill)) return 0;
+            AnonIPv6(cache, u);
     }
     memcpy(exporter->ip, u, sizeof(u));
     return 1;
