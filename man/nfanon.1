@@ -91,7 +91,7 @@ may name the input file, or a hard or symbolic link to it.
 .Pp
 A file in the nfdump 1.6 layout is written in the same layout: the records are
 anonymized in place, the blocks keep their order and compression, and the file
-header and statistics record are copied from the input. Each such file needs its
+header and statistics record are copied from the input, with the anonymized flag set. Each such file needs its
 own output file, so
 .Fl w
 with several input files fails, if one of them has the nfdump 1.6 layout.
