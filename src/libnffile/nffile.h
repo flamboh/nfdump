@@ -260,7 +260,7 @@ void DisposeFile(nffile_t *nffile);
 
 void DeleteFile(nffile_t *nffile);
 
-void CloseFile(nffile_t *nffile);
+int CloseFile(nffile_t *nffile);
 
 int FlushFile(nffile_t *nffile);
 

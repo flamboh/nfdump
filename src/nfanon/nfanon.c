@@ -732,7 +732,7 @@ static dataBlock_t *NextBlock(nffile_t *nffile, uint32_t *blockCount) {
 
 // finish the output file and rename it to finalName, if given
 static void CloseOutputFile(nffile_t *nffile, const char *outFile, const char *finalName) {
-    if (!FlushFile(nffile)) {
+    if (!FlushFile(nffile) || !CloseFile(nffile)) {
         LogError("Failed to write output file '%s'", outFile);
         exit(255);
     }
