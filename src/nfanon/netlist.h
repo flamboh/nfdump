@@ -36,14 +36,14 @@
 typedef struct netList_s netList_t;
 
 // Load a network list file. One IPv4/IPv6 CIDR per line, a bare address
-// is a host route. A leading '!' marks a network to preserve.
+// is a host route.
 // Returns NULL on error. All errors are logged.
 netList_t *NetListLoad(const char *fileName);
 
 void NetListFree(netList_t *netList);
 
 // Longest prefix match. Returns 1 if the address is to be anonymized,
-// 0 if no network matches or the best match is a preserve network.
+// 0 if no network matches.
 // Addresses are in host byte order. IPv4-mapped IPv6 addresses are
 // matched against the IPv4 networks.
 int NetListMatchV4(const netList_t *netList, uint32_t ip);

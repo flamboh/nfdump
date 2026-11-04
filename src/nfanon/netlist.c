@@ -46,7 +46,6 @@
 #include "util.h"
 
 #define MARK_NONE -1
-#define MARK_PRESERVE 0
 #define MARK_ANON 1
 
 // binary trie, one bit per level. Node 0 is unused and marks a missing child
@@ -106,7 +105,7 @@ int NetListMatchV6(const netList_t *netList, const uint64_t ip[2]) {
     return Lookup(netList, netList->root[1], ip, 128) == MARK_ANON;
 }  // End of NetListMatchV6
 
-// insert prefix. Returns 1 on success, 0 on memory error, -1 on conflicting entry
+// insert prefix. Returns 1 on success, 0 on memory error
 static int Insert(netList_t *netList, int family, const uint64_t ip[2], int prefixLen, int mark) {
     uint32_t n = netList->root[family];
     for (int i = 0; i < prefixLen; i++) {
@@ -119,7 +118,6 @@ static int Insert(netList_t *netList, int family, const uint64_t ip[2], int pref
         }
         n = next;
     }
-    if (netList->node[n].mark != MARK_NONE && netList->node[n].mark != mark) return -1;
     netList->node[n].mark = mark;
     return 1;
 }  // End of Insert
@@ -137,11 +135,9 @@ static int ParseLine(netList_t *netList, const char *fileName, unsigned lineNum,
     *e = '\0';
     if (*s == '\0') return 1;
 
-    int mark = MARK_ANON;
     if (*s == '!') {
-        mark = MARK_PRESERVE;
-        s++;
-        while (isspace((unsigned char)*s)) s++;
+        LogError("%s line %u: '!' preserve entries are not supported, every listed network is anonymized", fileName, lineNum);
+        return 0;
     }
 
     char *net = s;
@@ -198,7 +194,6 @@ static int ParseLine(netList_t *netList, const char *fileName, unsigned lineNum,
     }
 
     // an IPv4-mapped network ::ffff:a.b.c.d/n is the IPv4 network a.b.c.d/n-96
-    int listedLen = prefixLen;
     if (family == 1 && prefixLen >= 96 && ip[0] == 0 && (ip[1] >> 32) == 0xFFFF) {
         family = 0;
         ip[0] = (ip[1] & 0xFFFFFFFF) << 32;
@@ -206,13 +201,8 @@ static int ParseLine(netList_t *netList, const char *fileName, unsigned lineNum,
         prefixLen -= 96;
     }
 
-    int ret = Insert(netList, family, ip, prefixLen, mark);
-    if (ret == 0) return 0;
-    if (ret < 0) {
-        LogError("%s line %u: network '%s/%d' listed as both anonymize and preserve", fileName, lineNum, net, listedLen);
-        return 0;
-    }
-    if (mark == MARK_ANON) netList->numAnon++;
+    if (!Insert(netList, family, ip, prefixLen, MARK_ANON)) return 0;
+    netList->numAnon++;
 
     return 1;
 }  // End of ParseLine

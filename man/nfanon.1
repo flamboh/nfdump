@@ -129,13 +129,10 @@ Preserve destination addresses rather than anonymising them.
 Anonymize only addresses in the networks listed in
 .Ar file .
 The file contains one IPv4 or IPv6 network in CIDR notation per line. A bare
-address is a single host. A line starting with
-.Sy !
-lists a network to preserve. Blank lines and text after
+address is a single host. Blank lines and text after
 .Sy #
-are ignored. Each address is checked against the most specific matching
-network: it is anonymized only if that network is not a preserve network.
-Addresses that match no network are left unchanged.
+are ignored. An address in any listed network is anonymized; addresses that
+match no network are left unchanged.
 This applies to all addresses, including next hop, BGP next hop, router IP,
 NAT, tunnel and exporter addresses.
 .Fl s
