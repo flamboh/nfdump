@@ -421,11 +421,9 @@ static inline int AnonRecord(anonCache_t *cache, recordHeaderV3_t *v3Record, int
         return 0;
     }
 
-    // extensions are stored in any order. Remember the AS and ToS extensions and
-    // update them, after all addresses are processed
+    // extensions are stored in any order. Remember the ToS extension and
+    // update it, after all addresses are processed
     EXgenericFlow_t *genericFlow = NULL;
-    EXasRouting_t *asRouting = NULL;
-    EXasAdjacent_t *asAdjacent = NULL;
     int srcAnon = 0;
     int dstAnon = 0;
 
@@ -467,9 +465,8 @@ static inline int AnonRecord(anonCache_t *cache, recordHeaderV3_t *v3Record, int
                 break;
             case EXvLanID:
                 break;
-            case EXasRoutingID: {
-                asRouting = (EXasRouting_t *)((void *)elementHeader + sizeof(elementHeader_t));
-            } break;
+            case EXasRoutingID:
+                break;
             case EXbgpNextHopV4ID: {
                 EXbgpNextHopV4_t *bgpNextHopV4 = (EXbgpNextHopV4_t *)((void *)elementHeader + sizeof(elementHeader_t));
                 AnonIPv4(cache, &bgpNextHopV4->ip);
@@ -498,9 +495,8 @@ static inline int AnonRecord(anonCache_t *cache, recordHeaderV3_t *v3Record, int
                 break;
             case EXmacAddrID:
                 break;
-            case EXasAdjacentID: {
-                asAdjacent = (EXasAdjacent_t *)((void *)elementHeader + sizeof(elementHeader_t));
-            } break;
+            case EXasAdjacentID:
+                break;
             case EXlatencyID:
                 break;
             case EXnselCommonID:
@@ -543,27 +539,6 @@ static inline int AnonRecord(anonCache_t *cache, recordHeaderV3_t *v3Record, int
     if ((void *)elementHeader != eor) {
         LogError("Corrupt record: %u bytes after %u extensions", (unsigned)(eor - (void *)elementHeader), v3Record->numElements);
         return 0;
-    }
-
-    if (netList) {
-        // zero the AS numbers of the anonymized sides only
-        if (asRouting) {
-            if (srcAnon) asRouting->srcAS = 0;
-            if (dstAnon) asRouting->dstAS = 0;
-        }
-        if (asAdjacent) {
-            if (srcAnon) asAdjacent->prevAdjacentAS = 0;
-            if (dstAnon) asAdjacent->nextAdjacentAS = 0;
-        }
-    } else {
-        if (asRouting) {
-            if (anon_src) asRouting->srcAS = 0;
-            if (anon_dst) asRouting->dstAS = 0;
-        }
-        if (asAdjacent) {
-            asAdjacent->nextAdjacentAS = 0;
-            asAdjacent->prevAdjacentAS = 0;
-        }
     }
 
     if (mark_tos && genericFlow) {
@@ -849,20 +824,8 @@ static int AnonLegacyRecord(anonCache_t *cache, common_record_t *record, int ano
     p += TestFlag(record->flags, FLAG_PKG_64) ? sizeof(uint64_t) : sizeof(uint32_t);
     p += TestFlag(record->flags, FLAG_BYTES_64) ? sizeof(uint64_t) : sizeof(uint32_t);
 
-    uint16_t *as16 = NULL;
-    uint32_t *as32 = NULL;
-    tpl_ext_26_t *asAdjacent = NULL;
     for (int i = 0; i < map->numExt; i++) {
         switch (map->ext[i]) {
-            case EX_AS_2:
-                as16 = (uint16_t *)p;
-                break;
-            case EX_AS_4:
-                as32 = (uint32_t *)p;
-                break;
-            case EX_BGPADJ:
-                asAdjacent = (tpl_ext_26_t *)p;
-                break;
             case EX_NEXT_HOP_v4:
             case EX_NEXT_HOP_BGP_v4:
             case EX_ROUTER_IP_v4:
@@ -885,21 +848,9 @@ static int AnonLegacyRecord(anonCache_t *cache, common_record_t *record, int ano
         p += legacyExtSize[map->ext[i]];
     }
 
-    int zeroSrc = netList ? srcAnon : anon_src;
-    int zeroDst = netList ? dstAnon : anon_dst;
-    if (as16) {
-        if (zeroSrc) as16[0] = 0;
-        if (zeroDst) as16[1] = 0;
-    }
-    if (as32) {
-        if (zeroSrc) as32[0] = 0;
-        if (zeroDst) as32[1] = 0;
-    }
-    if (asAdjacent) {
-        if (netList ? srcAnon : 1) asAdjacent->bgpPrevAdjacentAS = 0;
-        if (netList ? dstAnon : 1) asAdjacent->bgpNextAdjacentAS = 0;
-    }
-    if (mark_tos) record->tos = (record->tos & 0xfc) | (zeroSrc ? 2 : 0) | (zeroDst ? 1 : 0);
+    int markSrc = netList ? srcAnon : anon_src;
+    int markDst = netList ? dstAnon : anon_dst;
+    if (mark_tos) record->tos = (record->tos & 0xfc) | (markSrc ? 2 : 0) | (markDst ? 1 : 0);
     return 1;
 }  // End of AnonLegacyRecord
 

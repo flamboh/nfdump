@@ -138,9 +138,9 @@ NAT, tunnel and exporter addresses.
 .Fl s
 and
 .Fl d
-still apply to the source and destination side. The source AS and previous
-adjacent AS are set to 0 only if the source address was anonymized, the
-destination AS and next adjacent AS only if the destination address was.
+still apply to the source and destination side.
+.Pp
+AS numbers, including the adjacent AS numbers, are never changed.
 .Pp
 IPv4-mapped IPv6 addresses (::ffff:0:0/96) are checked against the IPv4
 networks. A mapped network ::ffff:a.b.c.d/n with n >= 96 in
