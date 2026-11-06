@@ -49,11 +49,6 @@ static void InitCompat16(void) {
     extension_map_list = InitExtensionMaps(NEEDS_EXTENSION_LIST);
 }  // End of InitCompat16
 
-void ResetCompat16(void) {
-    FreeExtensionMaps(extension_map_list);
-    extension_map_list = NULL;
-}  // End of ResetCompat16
-
 static inline int ConvertRecordV2(common_record_t *commonRecord, dataBlock_t *dataBlock) {
     /*
      * v2 blocks are max 1MB. v3 blocks have 2MB.
@@ -384,19 +379,16 @@ static inline int ConvertRecordV2(common_record_t *commonRecord, dataBlock_t *da
             case EX_NSEL_USER_MAX: {
                 tpl_ext_43_t *tpl = (tpl_ext_43_t *)p;
                 PushExtension(recordHeader, EXnselUser, nselUser);
-                // the old username is not necessarily terminated - copy at most 65 chars
-                size_t len = strnlen(tpl->username, sizeof(nselUser->username) - 1);
-                memcpy(nselUser->username, tpl->username, len);
-                nselUser->username[len] = '\0';
+                tpl->username[65] = '\0';  // truncate old username
+                strncpy((void *)nselUser->username, (void *)tpl->username, 65);
+                nselUser->username[65] = '\0';
                 p = (void *)tpl->data;
             } break;
             case EX_NSEL_USER: {
                 tpl_ext_42_t *tpl = (tpl_ext_42_t *)p;
                 PushExtension(recordHeader, EXnselUser, nselUser);
-                // the 24 byte username is not necessarily terminated - do not read beyond it
-                size_t len = strnlen(tpl->username, sizeof(tpl->username));
-                memcpy(nselUser->username, tpl->username, len);
-                nselUser->username[len] = '\0';
+                strncpy((void *)nselUser->username, (void *)tpl->username, 65);
+                nselUser->username[65] = '\0';
                 p = (void *)tpl->data;
             } break;
             case EX_NEL_COMMON: {
