@@ -89,12 +89,8 @@ replaced, never written into, so
 .Ar nffile
 may name the input file, or a hard or symbolic link to it.
 .Pp
-A file in the nfdump 1.6 layout is written in the same layout: the records are
-anonymized in place, the blocks keep their order and compression, and the file
-header and statistics record are copied from the input, with the anonymized flag set. Each such file needs its
-own output file, so
-.Fl w
-with several input files fails, if one of them has the nfdump 1.6 layout.
+Only nfdump 1.7 files are anonymized. An input file in the nfdump 1.6 layout
+is an error.
 .It Fl K Ar key
 .Ar key
 is either a 32 character string, or a 64 char hex string starting with 0x. This key
@@ -172,7 +168,7 @@ Print help text to stdout and exit.
 .Sh EXIT STATUS
 .Nm
 returns 0 on success, and 1 or 255 otherwise. Any error is fatal: a record or block
-that can not be anonymized, a corrupt, truncated or unreadable input file, data
+that can not be anonymized, an nfdump 1.6 input file, a corrupt, truncated or unreadable input file, data
 blocks the file header does not count, bytes after the last block, or an
 output file that can not be written or closed completely, for example on a full disk.
 .Pp

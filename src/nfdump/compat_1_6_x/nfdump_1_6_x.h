@@ -39,6 +39,4 @@
 
 void ConvertBlockType2(dataBlock_t *v2DataBlock, dataBlock_t *v3DataBlock);
 
-void ResetCompat16(void);
-
 #endif  //_NFDUMP_H

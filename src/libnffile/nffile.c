@@ -62,7 +62,6 @@
 #include <pthread.h>
 #include <signal.h>
 #include <stdatomic.h>
-#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -875,9 +874,6 @@ nffile_t *OpenFile(const char *filename) {
 
 }  // End of OpenFile
 
-static nffile_t *InitNewFile(int fd, const char *filename, unsigned creator, unsigned compress, unsigned encryption, const void *header,
-                             uint32_t headerSize);
-
 static int CompressionAvailable(unsigned compress) {
 #ifndef HAVE_ZSTD
     if ((compress & 0xFFFF) == ZSTD_COMPRESSED) {
@@ -915,21 +911,6 @@ nffile_t *OpenNewFile(const char *filename, unsigned creator, unsigned compress,
 } /* End of OpenNewFile */
 
 nffile_t *OpenNewFileFd(int fd, const char *filename, unsigned creator, unsigned compress, unsigned encryption) {
-    return InitNewFile(fd, filename, creator, compress, encryption, NULL, 0);
-} /* End of OpenNewFileFd */
-
-nffile_t *OpenNewFileV1Fd(int fd, const char *filename, unsigned compress, const void *header, uint32_t headerSize) {
-    if (header == NULL || headerSize != sizeof(fileHeaderV1_t) + sizeof(stat_recordV1_t)) {
-        LogError("OpenNewFileV1Fd: invalid layout V1 header");
-        close(fd);
-        unlink(filename);
-        return NULL;
-    }
-    return InitNewFile(fd, filename, CREATOR_UNKNOWN, compress, NOT_ENCRYPTED, header, headerSize);
-} /* End of OpenNewFileV1Fd */
-
-static nffile_t *InitNewFile(int fd, const char *filename, unsigned creator, unsigned compress, unsigned encryption, const void *header,
-                             uint32_t headerSize) {
     if (!CompressionAvailable(compress)) {
         close(fd);
         unlink(filename);
@@ -939,7 +920,6 @@ static nffile_t *InitNewFile(int fd, const char *filename, unsigned creator, uns
     unsigned compression = COMPRESSION_TYPE(compress);
     // if file is not compressed, 2 workers are fine.
     unsigned NumThreads = compression == 0 ? 2 : NumWorkers;
-    if (header) NumThreads = 1;
 
     // Allocate/Init nffile struct
     nffile_t *nffile = NewFile(NumThreads);
@@ -950,19 +930,6 @@ static nffile_t *InitNewFile(int fd, const char *filename, unsigned creator, uns
     }
     nffile->fd = fd;
     nffile->fileName = strdup(filename);
-    if (header) {
-        nffile->headerV1 = malloc(headerSize);
-        if (!nffile->headerV1) {
-            LogError("malloc() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
-            close(nffile->fd);
-            nffile->fd = 0;
-            unlink(filename);
-            DisposeFile(nffile);
-            return NULL;
-        }
-        memcpy(nffile->headerV1, header, headerSize);
-        nffile->headerV1Size = headerSize;
-    }
 
     *nffile->file_header = (fileHeaderV2_t){.magic = MAGIC,
                                             .version = LAYOUT_VERSION_2,
@@ -974,9 +941,7 @@ static nffile_t *InitNewFile(int fd, const char *filename, unsigned creator, uns
 
     nffile->compression_level = COMPRESSION_LEVEL(compress);
 
-    int written = header ? WriteBuffer(nffile->fd, nffile->headerV1, nffile->headerV1Size)
-                         : WriteBuffer(nffile->fd, (void *)nffile->file_header, sizeof(fileHeaderV2_t));
-    if (!written) {
+    if (!WriteBuffer(nffile->fd, (void *)nffile->file_header, sizeof(fileHeaderV2_t))) {
         LogError("write() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
         close(nffile->fd);
         nffile->fd = 0;
@@ -1002,7 +967,7 @@ static nffile_t *InitNewFile(int fd, const char *filename, unsigned creator, uns
     }
     return nffile;
 
-} /* End of InitNewFile */
+} /* End of OpenNewFileFd */
 
 nffile_t *AppendFile(const char *filename) {
     nffile_t *nffile;
@@ -1114,7 +1079,7 @@ int FlushFile(nffile_t *nffile) {
         return 0;
     }
 
-    if (!nffile->headerV1 && !WriteAppendix(nffile)) {
+    if (!WriteAppendix(nffile)) {
         LogError("Failed to write appendix");
         return 0;
     }
@@ -1126,10 +1091,7 @@ int FlushFile(nffile_t *nffile) {
         return 0;
     }
 
-    if (nffile->headerV1) memcpy(nffile->headerV1 + offsetof(fileHeaderV1_t, NumBlocks), &nffile->file_header->NumBlocks, sizeof(uint32_t));
-    int written = nffile->headerV1 ? WriteBuffer(nffile->fd, nffile->headerV1, nffile->headerV1Size)
-                                   : WriteBuffer(nffile->fd, (void *)nffile->file_header, sizeof(fileHeaderV2_t));
-    if (!written) {
+    if (!WriteBuffer(nffile->fd, (void *)nffile->file_header, sizeof(fileHeaderV2_t))) {
         LogError("write() error in %s line %d: %s", __FILE__, __LINE__, strerror(errno));
         close(nffile->fd);
         nffile->fd = 0;
@@ -1188,7 +1150,6 @@ void DisposeFile(nffile_t *nffile) {
     if (nffile->stat_record) free(nffile->stat_record);
     if (nffile->ident) free(nffile->ident);
     if (nffile->fileName) free(nffile->fileName);
-    if (nffile->headerV1) free(nffile->headerV1);
 
     queue_free(nffile->processQueue);
     free(nffile);
